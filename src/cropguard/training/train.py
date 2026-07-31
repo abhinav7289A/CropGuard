@@ -25,18 +25,33 @@ from cropguard.training.module import CropGuardModule
 
 
 def build_logger(cfg: dict, experiment: str) -> Logger:
-    """W&B when it is installed and enabled, otherwise a local CSV logger.
+    """W&B when it is installed, enabled and reachable; otherwise a local CSV logger.
 
     Keeping this a soft dependency means CI and offline machines can run the exact same
     training entrypoint as the GPU box, instead of a diverging code path.
-    """
-    if os.environ.get("WANDB_MODE") != "disabled":
-        try:
-            from pytorch_lightning.loggers import WandbLogger
 
-            return WandbLogger(project=cfg["wandb"]["project"], name=experiment)
-        except (ImportError, ModuleNotFoundError):
-            print("wandb not available — falling back to CSVLogger (logs/).")
+    Failures here are downgraded to CSV logging rather than raised. Losing hours of GPU time
+    to a bad API key, an unknown entity, or a network blip would be a bad trade for metrics
+    that are, in the end, a convenience — the checkpoints and test metrics do not depend on
+    the logger. W&B initialises lazily, so `.experiment` is touched here to force the
+    connection *now*, where it can still be caught, instead of mid-`fit`.
+    """
+    if os.environ.get("WANDB_MODE") == "disabled":
+        return CSVLogger("logs", name=experiment)
+
+    try:
+        from pytorch_lightning.loggers import WandbLogger
+
+        logger = WandbLogger(project=cfg["wandb"]["project"], name=experiment)
+        logger.experiment  # noqa: B018 — forces wandb.init() while it is still catchable
+        return logger
+    except (ImportError, ModuleNotFoundError):
+        print("wandb is not installed — logging to CSV instead (logs/).")
+    except Exception as exc:
+        print(f"W&B unavailable ({type(exc).__name__}: {exc})")
+        print("Continuing with CSV logging (logs/) — training is unaffected.")
+        if "entity" in str(exc).lower():
+            print("Hint: unset WANDB_ENTITY to use your account's default entity.")
     return CSVLogger("logs", name=experiment)
 
 
