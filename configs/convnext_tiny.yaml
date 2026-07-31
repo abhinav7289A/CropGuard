@@ -1,0 +1,17 @@
+# Challenger: ConvNeXt-Tiny, heavy augmentation. Final config refined after the W&B sweep.
+extends: base.yaml
+
+experiment_name: convnext-tiny-challenger
+
+model:
+  name: convnext_tiny
+  pretrained: true
+  dropout: 0.3
+
+train:
+  epochs: 30
+  batch_size: 48
+  lr: 1.0e-4
+  weight_decay: 5.0e-2
+
+augmentation: heavy

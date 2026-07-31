@@ -1,0 +1,16 @@
+# Baseline: ResNet50, ImageNet-pretrained, medium augmentation.
+extends: base.yaml
+
+experiment_name: resnet50-baseline
+
+model:
+  name: resnet50
+  pretrained: true
+  dropout: 0.2
+
+train:
+  epochs: 12
+  batch_size: 64
+  lr: 3.0e-4
+
+augmentation: medium

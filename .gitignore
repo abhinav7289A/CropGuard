@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Data & models (DVC-tracked or too large for git).
+# Leading slashes anchor these to the repo root — an unanchored `data/` would also match
+# src/cropguard/data/ and silently drop the whole data pipeline from version control.
+/data/
+/models/
+/checkpoints/
+/logs/
+/artifacts/
+*.ckpt
+*.onnx
+*.pth
+mlruns/
+wandb/
+
+# DVC
+!/data/**/*.dvc
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Env & secrets
+.env
+*.env
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Personal planning doc — kept locally, never published
+workflow.md

@@ -1,0 +1,11 @@
+.git/
+data/
+checkpoints/
+mlruns/
+wandb/
+notebooks/
+frontend/
+tests/
+*.ckpt
+.venv/
+__pycache__/

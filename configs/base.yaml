@@ -1,0 +1,39 @@
+# Base config — merged under experiment-specific configs.
+seed: 42
+
+data:
+  # Set CROPGUARD_DATA_DIR env var to override (recommended: a path OUTSIDE OneDrive,
+  # e.g. C:\cropguard-data locally; /teamspace/studios/this_studio/data on Lightning AI).
+  root: data
+  dataset: plantvillage
+  image_size: 224
+  num_workers: 4
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  validation:
+    min_resolution: 128
+    min_samples_per_class: 100
+
+train:
+  epochs: 15
+  batch_size: 64
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 1
+  precision: 16-mixed
+  early_stopping_patience: 5
+  label_smoothing: 0.1
+
+augmentation: medium   # light | medium | heavy
+
+wandb:
+  project: cropguard-mlops
+  # entity: set via WANDB_ENTITY env var
+
+hub:
+  # HF Hub repo for model weights, e.g. "abhinavbhatia/cropguard-models"
+  repo_id: null
