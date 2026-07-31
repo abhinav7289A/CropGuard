@@ -67,6 +67,9 @@ where = ["src"]
 line-length = 100
 target-version = "py310"
 src = ["src", "tests"]
+# Notebook cells legitimately import mid-file and rely on names defined in earlier cells,
+# which trips E402/F821 for no benefit.
+extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]

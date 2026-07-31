@@ -1,4 +1,9 @@
-"""YAML experiment config loading with single-level `extends` inheritance."""
+"""YAML experiment config loading with recursive `extends` inheritance.
+
+A config may extend a parent that itself extends another, and each level is deep-merged onto
+the one above. That chaining is relied on: the Colab configs extend `resnet50_baseline.yaml`,
+which extends `base.yaml`, to override only `data.num_workers` for a 2-vCPU runtime.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +27,12 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
-    """Load a YAML config, merging its `extends` parent (resolved relative to configs/)."""
+    """Load a YAML config, deep-merging its `extends` chain (resolved relative to configs/).
+
+    Deep-merge, not replace: a child overriding `train.lr` keeps the rest of the parent's
+    `train` block. A shallow merge would silently drop optimizer, scheduler and early-stopping
+    settings — training would still run, just not with the settings you think.
+    """
     path = Path(path)
     if not path.exists() and (CONFIG_DIR / path).exists():
         path = CONFIG_DIR / path

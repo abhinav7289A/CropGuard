@@ -85,6 +85,17 @@ endpoint, drift detection, Grafana, Render deployment, load testing.
 | `.gitignore` | Ignore rules — note the anchoring bug described in §4.3. |
 | `.github/workflows/ci.yml` | Three jobs: lint, test, and a Docker build + container smoke test. |
 | `scripts/fetch_model.py` | Pulls model weights from HF Hub at container start if not baked in. |
+| `notebooks/01_train_baseline_colab.ipynb` | End-to-end baseline training on a Colab T4, plus the optional leakage ablation. |
+
+### Tests worth knowing about
+
+| File | Guards |
+|---|---|
+| `test_import_isolation.py` | `serving`/`evaluation` never import torch — the invariant the free-tier deploy rests on. |
+| `test_preprocess.py` | The NumPy serving preprocessor against torchvision. Guards training/serving skew. |
+| `test_data_groups.py` | Group integrity and stratification of the leaf-grouped split. |
+| `test_onnx_export.py` | The exported graph stays quantizable — the trap in §3.7. |
+| `test_hypothesis.py` | Statistics checked against textbook values, scipy, and published power tables. |
 
 ---
 
@@ -318,21 +329,54 @@ ignored at all (training would have offered 268MB of checkpoints for commit).
 **Lesson:** after adding an ignore rule, run `git status --short` and confirm the file count
 is what you expect.
 
-### 4.4 OneDrive is hostile to this project
+### 4.4 Keep the dataset out of OneDrive
 
-The repo lives under OneDrive, which has caused real damage:
+The repo lives under OneDrive. The dataset must not: 54K small files sync appallingly and can
+be locked mid-write during training, which is why `CROPGUARD_DATA_DIR` points at
+`C:\cropguard-data`.
 
-- **Dataset:** 54K small files sync appallingly and can be locked mid-write during training.
-  Hence `CROPGUARD_DATA_DIR` pointing at `C:\cropguard-data`.
-- **Git:** on 2026-07-31 the local `.git` directory was reset to an empty state *after* a
-  successful push — losing all local history. The remote was unaffected, and working files
-  survived, but the local repo had to be relinked to the remote.
-
-**Recommendation:** move the whole project out of OneDrive, or exclude the folder from sync.
+*Correction (2026-07-31):* an earlier version of this section also blamed OneDrive for the
+local `.git` directory being reset to empty on 2026-07-31. That was wrong — the directory was
+deleted deliberately, by hand, to re-push the repository. OneDrive was not involved and the
+repo source tree is fine where it is. Recorded here because a maintenance log that
+misattributes a cause is worse than no log at all.
 
 ---
 
 ## 5. Change log
+
+### 2026-07-31 (later) — Phase 0: Colab notebook and guard rails
+
+**Added**
+
+- `notebooks/01_train_baseline_colab.ipynb` — end-to-end T4 training: clone → download →
+  validate → split → train → ONNX/INT8 → holdout eval. Includes an optional **leakage
+  ablation** section that retrains on the naive split to quantify the accuracy inflation.
+- `tests/test_import_isolation.py` — enforces that `cropguard.serving` and
+  `cropguard.evaluation` import **without torch**, in a subprocess with torch blocked. This
+  invariant is what keeps the serving image inside the free tier, and nothing previously
+  checked it — every dev machine has torch, so a stray import would only fail in production.
+  Includes a "guard the guard" test: if the import blocker ever stopped working, the other
+  seven tests would pass vacuously.
+- `test_extends_chains_through_multiple_levels` — the Colab configs use a 3-level chain
+  (`colab_resnet50` → `resnet50_baseline` → `base`), so that behaviour is now pinned.
+
+**Fixed**
+
+- `config.py` documented "single-level `extends`" while the implementation recurses. The
+  notebook depends on the recursion, so the docstring was corrected rather than the code.
+- `src/cropguard/data/*` had **never been linted**. Ruff respects `.gitignore`, and the
+  unanchored `data/` rule (§4.3) hid the whole package from it. Fixing the ignore rule
+  exposed a latent `UP035`. A reminder that an over-broad ignore rule silently disables
+  tooling, not just version control.
+- `notebooks/` excluded from ruff — cells legitimately import mid-file.
+
+**Split reproducibility.** The notebook asserts `splits.json` hashes to
+`9764d8f2eb2046…` on Colab, matching the local split. This is what allows training on Colab
+without transferring the 2.2GB dataset: the split is regenerated from `seed: 42` rather than
+copied. If that assert fires, results are not comparable and training should stop.
+
+Tests: 81 → **90**.
 
 ### 2026-07-31 — Data pipeline, evaluation framework, first commit
 

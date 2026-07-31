@@ -84,8 +84,12 @@ def validate_imagefolder(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/base.yaml")
-    parser.add_argument("--min-samples-per-class", type=int, default=None,
-                        help="Override config (use a low value for smoke-test subsets)")
+    parser.add_argument(
+        "--min-samples-per-class",
+        type=int,
+        default=None,
+        help="Override config (use a low value for smoke-test subsets)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -99,8 +103,10 @@ def main() -> None:
         json.dump(report.to_dict(), f, indent=2)
 
     print(f"Validated {report.total_images} images in {len(report.class_counts)} classes")
-    print(f"Corrupt: {len(report.corrupt)} | Low-res: {len(report.low_resolution)} "
-          f"| Underpopulated classes: {len(report.underpopulated_classes)}")
+    print(
+        f"Corrupt: {len(report.corrupt)} | Low-res: {len(report.low_resolution)} "
+        f"| Underpopulated classes: {len(report.underpopulated_classes)}"
+    )
     print(f"Report: {out_path}")
     if not report.passed:
         print("VALIDATION FAILED", file=sys.stderr)

@@ -27,6 +27,22 @@ def test_challenger_overrides_augmentation():
     assert cfg["train"]["weight_decay"] == pytest.approx(5.0e-2)
 
 
+def test_extends_chains_through_multiple_levels(tmp_path, monkeypatch):
+    """The Colab configs rely on a 3-level chain: colab -> resnet50_baseline -> base."""
+    child = CONFIG_DIR / "_test_nested.yaml"
+    child.write_text(
+        "extends: resnet50_baseline.yaml\n\ndata:\n  num_workers: 2\n", encoding="utf-8"
+    )
+    try:
+        cfg = load_config(child)
+        assert cfg["data"]["num_workers"] == 2  # from the child
+        assert cfg["model"]["name"] == "resnet50"  # from the middle config
+        assert cfg["train"]["optimizer"] == "adamw"  # from the root config
+        assert cfg["data"]["image_size"] == 224  # sibling key survives the override
+    finally:
+        child.unlink()
+
+
 def test_env_var_overrides_data_root(monkeypatch, tmp_path):
     monkeypatch.setenv("CROPGUARD_DATA_DIR", str(tmp_path))
     cfg = load_config(CONFIG_DIR / "base.yaml")
