@@ -345,6 +345,42 @@ misattributes a cause is worse than no log at all.
 
 ## 5. Change log
 
+### 2026-07-31 (later still) — Docker fix and deployment config
+
+**Fixed — the Docker build was broken outright**
+
+`Dockerfile` ended with `COPY models*/ models/`. `models/` is gitignored, so it does not exist
+in a clean checkout, and **a `COPY` whose glob matches nothing fails the build** rather than
+being skipped. Every `docker build` from a fresh clone failed, and the CI `docker` job with it.
+
+The intent — "bake the model in if it happens to be there" — is not expressible with `COPY`.
+Replaced with an explicit build-time fetch from HF Hub behind `ARG CROPGUARD_HF_REPO`, falling
+back to the existing startup fetch. A comment now marks the trap so it does not come back.
+
+Also hardened while in there: non-root user, `HEALTHCHECK`, `PYTHONDONTWRITEBYTECODE`, and
+dependency layers ordered before application code so edits do not trigger a full reinstall.
+
+**Fixed — CI was quieter than it looked**
+
+The test job installed `.[data,serve,dev]` but not `timm` or `pytorch-lightning`, so
+`test_onnx_export.py`'s `importorskip("timm")` silently skipped **all 6 tests** — including the
+regression test for the INT8 quantization bug — while CI still reported green. Skips are not
+failures, so nothing surfaced.
+
+Now installs the train-only deps, runs pytest with `-rs` so skip reasons appear in the log,
+and fails the job outright if the ONNX tests skip. A test that silently stops running is worse
+than no test, because it still reads as coverage.
+
+**Added**
+
+- `render.yaml` — Render Blueprint: free plan, Docker runtime, `/health` health check, and a
+  `buildFilter` so notebook and docs edits do not trigger redeploys.
+
+**Note on Render specifically.** Render does not forward Blueprint env vars into the Docker
+build, so `CROPGUARD_HF_REPO` reaches the container at runtime, not build time — the weights
+are fetched at startup there, and the `--build-arg` bake applies to local builds only. On a
+tier that sleeps after 15 minutes that means ~26MB re-downloaded per cold start.
+
 ### 2026-07-31 (later) — Phase 0: Colab notebook and guard rails
 
 **Added**

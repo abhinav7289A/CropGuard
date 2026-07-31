@@ -1,18 +1,55 @@
-# Serving image — CPU-only ONNX Runtime, no torch. Target: well under 500MB.
+# Serving image - CPU-only ONNX Runtime, no torch. Target: well under 500MB.
+#
+# Build with the model baked in (recommended for Render's free tier, where the instance
+# spins down after 15 minutes idle and would otherwise re-download on every cold start):
+#     docker build --build-arg CROPGUARD_HF_REPO=<user>/cropguard-models -t cropguard .
+#
+# Build without it - the API starts degraded and fetch_model.py pulls the weights at boot:
+#     docker build -t cropguard .
 FROM python:3.11-slim AS base
 
 WORKDIR /app
-ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
 
+# Dependencies first: this layer is cached unless pyproject.toml changes, so application
+# edits do not trigger a full reinstall on every build.
 COPY pyproject.toml README.md ./
 COPY src/ src/
-RUN pip install ".[serve]" huggingface_hub
+RUN pip install --no-cache-dir ".[serve]" huggingface_hub
 
 COPY configs/classes.json configs/classes.json
 COPY scripts/fetch_model.py scripts/fetch_model.py
-# Bake the model in if present at build time (models/ may be empty pre-training;
-# then fetch_model.py pulls it from HF Hub at startup instead).
-COPY models*/ models/
+
+# Bake the weights in at build time when a repo is supplied. `|| true` keeps the build
+# working without one - the model is then fetched at startup instead.
+#
+# NOTE: do not reintroduce `COPY models*/ models/` here. models/ is gitignored, so it does
+# not exist in a clean checkout, and a COPY whose glob matches nothing fails the build
+# outright rather than being skipped.
+ARG CROPGUARD_HF_REPO=""
+ARG CROPGUARD_MODEL_FILE="cropguard.int8.onnx"
+ENV CROPGUARD_MODEL_PATH=/app/models/cropguard.int8.onnx
+RUN mkdir -p models && \
+    if [ -n "$CROPGUARD_HF_REPO" ]; then \
+        CROPGUARD_HF_REPO="$CROPGUARD_HF_REPO" \
+        CROPGUARD_MODEL_FILE="$CROPGUARD_MODEL_FILE" \
+        python scripts/fetch_model.py || echo "build-time model fetch failed; will retry at startup"; \
+    else \
+        echo "no CROPGUARD_HF_REPO supplied - model will be fetched at startup"; \
+    fi
+
+# Run as a non-root user; nothing here needs write access outside /app/models.
+RUN useradd --create-home --uid 10001 cropguard && chown -R cropguard:cropguard /app
+USER cropguard
 
 EXPOSE 8000
+
+# /health reports "degraded" (HTTP 200) when no model is loaded, so this checks the process
+# is serving, not that a model exists - which is what lets the container deploy before the
+# first model is trained.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=4).status==200 else 1)"
+
 CMD ["sh", "-c", "python scripts/fetch_model.py && uvicorn cropguard.serving.app:app --host 0.0.0.0 --port ${PORT:-8000}"]

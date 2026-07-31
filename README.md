@@ -120,12 +120,40 @@ All settings are env vars with the `CROPGUARD_` prefix:
 ## Docker
 
 ```bash
+# Weights fetched from HF Hub on startup
 docker build -t cropguard .
 docker run -p 8000:8000 -e CROPGUARD_HF_REPO=<user>/cropguard-models cropguard
+
+# Or bake them into the image (faster cold starts)
+docker build --build-arg CROPGUARD_HF_REPO=<user>/cropguard-models -t cropguard .
+docker run -p 8000:8000 cropguard
 ```
 
-CPU-only ONNX Runtime, no torch — the image stays well under 500MB. If `models/` is empty at
-build time, `scripts/fetch_model.py` pulls weights from HF Hub on startup instead.
+CPU-only ONNX Runtime, no torch — the image stays well under 500MB. It runs as a non-root
+user and ships a `HEALTHCHECK`. With no model available the API starts *degraded* rather than
+crashing, so the container is deployable and health-checkable before a model exists.
+
+## Deployment (Render free tier)
+
+`render.yaml` is a Render Blueprint — **New → Blueprint** in the dashboard, pointed at this
+repo, builds the Dockerfile and wires up the service. Model weights come from HuggingFace Hub
+via `CROPGUARD_HF_REPO`, so the ONNX file never has to live in git.
+
+Free-tier realities worth knowing before relying on it:
+
+| Limit | Consequence |
+|---|---|
+| 512 MB RAM | ONNX Runtime + ResNet50-INT8 fits, without much headroom |
+| 0.1 vCPU | Inference is seconds per image, not milliseconds |
+| Sleeps after 15 min idle | ~50s cold start, plus a ~26MB weight re-download |
+
+Render does not forward Blueprint env vars into the Docker build, so on Render the weights are
+fetched at **startup**; the `--build-arg` bake above applies to local builds. If cold starts
+become annoying, committing `cropguard.int8.onnx` (~26MB) so Docker can `COPY` it is the
+pragmatic alternative — at the cost of versioning a binary next to the code.
+
+If 0.1 vCPU proves too slow for a demo, HuggingFace Spaces (2 vCPU / 16GB, free) is better
+hardware, though a weaker "production deployment" story.
 
 ## Experiments
 

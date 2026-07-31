@@ -1,0 +1,73 @@
+# Render Blueprint — infrastructure as code for the CropGuard API.
+#
+# Deploy: Render dashboard > New > Blueprint > point at this repo.
+# Render reads this file, builds the Dockerfile, and wires up the service.
+#
+# Free tier limits worth knowing before you rely on this:
+#   - 512 MB RAM      ONNX Runtime + ResNet50-INT8 fits, but not with much headroom.
+#   - 0.1 vCPU        Inference is on the order of seconds per image, not milliseconds.
+#   - sleeps at 15m   First request after idle pays a ~50s cold start.
+#
+# Model delivery: on Render the weights are pulled from HF Hub at *startup*, by the
+# fetch_model.py step in the Dockerfile CMD, using CROPGUARD_HF_REPO below. Render does not
+# forward these env vars into the Docker build, so the build-time bake documented in the
+# Dockerfile applies to local/manual builds only (`docker build --build-arg ...`).
+#
+# The practical cost is ~26MB re-downloaded on each cold start, adding a few seconds on top
+# of the ~50s spin-up. If that becomes annoying, the alternative is committing
+# cropguard.int8.onnx to the repo so Docker can COPY it — 26MB is within git's comfort zone,
+# at the cost of versioning a binary artifact alongside the code.
+
+services:
+  - type: web
+    name: cropguard-api
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+
+    # /health returns 200 with {"status": "degraded"} when no model is loaded, so Render
+    # considers the service live as soon as the process serves — deliberately decoupling
+    # "the service is up" from "a model is loaded".
+    healthCheckPath: /health
+
+    autoDeploy: true
+
+    buildFilter:
+      paths:
+        - src/**
+        - configs/**
+        - scripts/**
+        - Dockerfile
+        - pyproject.toml
+      ignoredPaths:
+        - notebooks/**
+        - tests/**
+        - "**/*.md"
+
+    envVars:
+      # Bump this whenever you deploy new weights — it is echoed in every prediction
+      # response and tagged on every Prometheus metric, so it is how you tell which model
+      # produced a given result.
+      - key: CROPGUARD_MODEL_VERSION
+        value: v0.1.0-resnet50-baseline
+
+      - key: CROPGUARD_MODEL_PATH
+        value: /app/models/cropguard.int8.onnx
+
+      - key: CROPGUARD_CLASSES_PATH
+        value: /app/configs/classes.json
+
+      # Comma-separated. Tighten this to your own frontend origin before sharing the URL.
+      - key: CROPGUARD_CORS_ORIGINS
+        value: "*"
+
+      - key: CROPGUARD_MAX_UPLOAD_MB
+        value: "10"
+
+      # HF Hub repo holding cropguard.int8.onnx. Set it in the Render dashboard (or here)
+      # and the Dockerfile bakes the weights in during build. Left unset, the API still
+      # deploys — it just reports "degraded" until a model is supplied.
+      - key: CROPGUARD_HF_REPO
+        sync: false
