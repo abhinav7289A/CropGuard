@@ -47,7 +47,7 @@ flowchart TD
     C --> D[leaf-grouped split 70/15/15 → splits.json]
     D --> E[Lightning training · timm backbone]
     E -->|W&B: metrics, artifacts| F[checkpoint]
-    F --> G[ONNX export + INT8 quantize + parity check]
+    F --> G[ONNX export + parity check]
     G --> H[FastAPI + ONNX Runtime]
     H --> I[/predict · /health · /metrics/]
     I --> J[Prometheus → Grafana]
@@ -140,7 +140,7 @@ All settings are env vars with the `CROPGUARD_` prefix:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CROPGUARD_MODEL_PATH` | `models/cropguard.int8.onnx` | ONNX weights |
+| `CROPGUARD_MODEL_PATH` | `models/cropguard.onnx` | ONNX weights |
 | `CROPGUARD_CLASSES_PATH` | `configs/classes.json` | label order |
 | `CROPGUARD_MODEL_VERSION` | `v0.1.0-baseline` | reported in responses + metrics |
 | `CROPGUARD_CORS_ORIGINS` | `http://localhost:5173` | comma-separated |
@@ -163,6 +163,26 @@ CPU-only ONNX Runtime, no torch — the image stays well under 500MB. It runs as
 user and ships a `HEALTHCHECK`. With no model available the API starts *degraded* rather than
 crashing, so the container is deployable and health-checkable before a model exists.
 
+### Why fp32 is served, not INT8
+
+| | fp32 | dynamic INT8 | static INT8 |
+|---|---|---|---|
+| Size | 94.3 MB | 23.8 MB | 23.8 MB |
+| Latency (batched, i5-12450H) | **24.4 ms** | 1569 ms | 78.0 ms |
+| Conv op | `Conv` | `ConvInteger` | `QLinearConv` |
+| Accuracy (n=3000) | 0.9893 | — | 0.9897 (n.s.) |
+
+`quantize_dynamic` rewrites every `Conv` into `ConvInteger`, which ONNX Runtime's CPU backend
+has no optimized kernel for — a **75× regression**. Dynamic quantization suits
+MatMul-dominated models (Transformers, RNNs), not CNNs. `cropguard.serving.quantize` does it
+properly with calibration and emits `QLinearConv`, which is 20× faster.
+
+It is still 3.2× slower than fp32 **on this hardware**, because an i5-12450H has no VNNI
+instructions and INT8 convolution needs one to beat tuned fp32 FMA kernels. Server CPUs
+generally do have AVX-512 VNNI, so this benchmark does not settle the question — **the
+measurement that decides is the one taken on the deployment target**, and it hasn't been taken
+yet. fp32 ships until then. See [`brain.md`](brain.md) §9.
+
 ## Deployment (Render free tier)
 
 `render.yaml` is a Render Blueprint — **New → Blueprint** in the dashboard, pointed at this
@@ -173,14 +193,14 @@ Free-tier realities worth knowing before relying on it:
 
 | Limit | Consequence |
 |---|---|
-| 512 MB RAM | ONNX Runtime + ResNet50-INT8 fits, without much headroom |
+| 512 MB RAM | ONNX Runtime + ResNet50 fp32 (94MB) fits, without much headroom |
 | 0.1 vCPU | Inference is seconds per image, not milliseconds |
 | Sleeps after 15 min idle | ~50s cold start, plus a ~26MB weight re-download |
 
-Render does not forward Blueprint env vars into the Docker build, so on Render the weights are
-fetched at **startup**; the `--build-arg` bake above applies to local builds. If cold starts
-become annoying, committing `cropguard.int8.onnx` (~26MB) so Docker can `COPY` it is the
-pragmatic alternative — at the cost of versioning a binary next to the code.
+The Dockerfile's `CROPGUARD_HF_REPO` build ARG carries a default, which is what bakes the
+weights into the image — Render never forwards Blueprint env vars into a Docker build, so
+anything needing a passed `--build-arg` would silently fall back to downloading 94MB on every
+cold start.
 
 If 0.1 vCPU proves too slow for a demo, HuggingFace Spaces (2 vCPU / 16GB, free) is better
 hardware, though a weaker "production deployment" story.
@@ -252,7 +272,8 @@ guard against training/serving skew.
 
 - [x] Data pipeline: download, validation, leakage-free leaf-grouped split
 - [x] Lightning training loop, W&B logging, resumable checkpoints
-- [x] ONNX export with INT8 quantization and PyTorch parity check
+- [x] ONNX export with PyTorch parity check
+- [x] Static INT8 quantization — built and measured; **not deployed**, see below
 - [x] FastAPI serving, Prometheus metrics, Docker image
 - [x] Test suite and CI
 - [x] Hypothesis testing: McNemar, bootstrap CI, Cohen's d, power analysis

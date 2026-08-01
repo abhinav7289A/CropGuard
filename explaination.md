@@ -7,7 +7,7 @@ way, including the decisions that are not obvious from reading the code.
 Every entry is dated. When behaviour changes, the old explanation is not deleted — it is
 marked superseded, so the reasoning trail stays intact.
 
-**Last updated:** 2026-07-31
+**Last updated:** 2026-08-01
 
 ---
 
@@ -18,7 +18,7 @@ marked superseded, so the reasoning trail stays intact.
 | **Critical path** | Week 1 Day 6–7 complete — **baseline trained** |
 | **Baseline** | ResNet50, **99.11% test accuracy / 0.9865 macro-F1** on the leak-free holdout |
 | **Built ahead of schedule** | Week 3 A/B testing, most of Week 4 serving |
-| **Tests** | 96 passing, ruff clean |
+| **Tests** | 101 passing, ruff clean |
 | **Dataset** | 54,305 images / 38 classes at `C:\cropguard-data` (outside OneDrive) |
 | **Repo** | github.com/abhinav7289A/CropGuard |
 | **Models** | `XiElonMAsk/cropguard-models` on HF Hub |
@@ -81,7 +81,8 @@ that accuracy would fall, and it did not.
 |---|---|
 | `app.py` | FastAPI app: `/predict`, `/health`, `/metrics`. See §3.8. |
 | `model_loader.py` | ONNX Runtime inference + the NumPy preprocessor. **No torch.** See §3.7. |
-| `onnx_export.py` | Checkpoint → ONNX → INT8, gated by a PyTorch parity check. See §3.7. |
+| `onnx_export.py` | Checkpoint → ONNX, gated by a PyTorch parity check. See §3.7. |
+| `quantize.py` | Static INT8 quantisation with calibration on the validation split. |
 
 ### Evaluation — `src/cropguard/evaluation/`
 
@@ -113,6 +114,8 @@ that accuracy would fall, and it did not.
 | `test_data_groups.py` | Group integrity and stratification of the leaf-grouped split. |
 | `test_onnx_export.py` | The exported graph stays quantizable — the trap in §3.7. |
 | `test_hypothesis.py` | Statistics checked against textbook values, scipy, and published power tables. |
+| `test_quantization.py` | The quantised graph emits `QLinearConv`, never `ConvInteger`. |
+| `test_train_logger.py` | A W&B failure degrades to CSV instead of killing a training run. |
 
 ---
 
@@ -128,8 +131,9 @@ Render's free tier is memory- and disk-constrained. A torch install is ~2GB; ONN
 - `cropguard.training` is the only torch-dependent subpackage
 
 `src/cropguard/__init__.py` is kept free of heavy imports for the same reason. **If you ever
-add `import torch` to `serving/` or `evaluation/`, the deployment breaks.** That constraint is
-not enforced by a test yet — worth adding.
+add `import torch` to `serving/` or `evaluation/`, the deployment breaks** — and it would break
+only in production, since every dev machine has torch installed. `test_import_isolation.py`
+enforces it by importing those modules in a subprocess with torch blocked.
 
 ### 3.2 Config inheritance
 
@@ -361,6 +365,37 @@ misattributes a cause is worse than no log at all.
 ---
 
 ## 5. Change log
+
+### 2026-08-01 (phase B) — Static quantisation: built, measured, not deployed
+
+`src/cropguard/serving/quantize.py` implements static INT8 quantisation with calibration on
+the **validation** split (never test — the holdout decides whether a model ships, so letting
+it shape how the model is built would contaminate that decision). The calibration sample is
+spread evenly across classes, since activation ranges are set by the extremes a layer sees and
+a random draw from a 36x-imbalanced split would barely touch the rare classes.
+
+| | fp32 | dynamic INT8 | static INT8 |
+|---|---|---|---|
+| Size | 94.3 MB | 23.8 MB | 23.8 MB |
+| Latency (batched) | **24.4 ms** | 1569 ms | 78.0 ms |
+| Conv op | `Conv` | `ConvInteger` | `QLinearConv` |
+| Accuracy (n=3000) | 0.9893 | - | 0.9897 (+0.0003, n.s.) |
+
+**20x faster than dynamic, still 3.2x slower than fp32** - because this machine (i5-12450H)
+has no VNNI instructions. INT8 convolution needs a hardware dot-product instruction to beat
+fp32; without it ONNX Runtime emulates each INT8 MAC in several AVX2 instructions while fp32
+runs on tuned FMA kernels.
+
+**So the deployment decision is still open**, and deliberately so: the benchmark was taken on
+the wrong hardware. Render runs server CPUs, which usually *do* have AVX-512 VNNI, and static
+INT8 would likely win there on both axes. That measurement has to happen on the target.
+fp32 stays deployed until it does.
+
+**New tests (5).** Latency is too machine-dependent to assert in CI; op types are not. The
+tests pin that static quantisation emits `QLinearConv` and never `ConvInteger`, that it does
+not insert a `DynamicQuantizeLinear` per layer, and - deliberately - that `quantize_dynamic`
+*does* still produce `ConvInteger`. That last one turns a future ONNX Runtime fix into a
+visible test failure rather than a silently outdated decision.
 
 ### 2026-08-01 — Baseline trained, and the pipeline proved reproducible across machines
 

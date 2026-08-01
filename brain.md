@@ -556,7 +556,27 @@ Requiring the CI to exclude zero adds an effect-magnitude condition on top of si
 `compare.py` exits non-zero unless all three hold, so CI gates promotion on **evidence**
 rather than a raw accuracy delta.
 
-### 8.6 Multiple comparisons — a limitation to own
+### 8.6 "Not significant" is not "equivalent"
+
+Comparing static-INT8 against fp32 gave p = 1.0 with a CI spanning [-0.0017, +0.0023], on
+**9 discordant pairs out of 3000**. It is tempting to report that as "quantisation is
+lossless". It is not what the test says.
+
+A null result means *we failed to detect a difference*. Proving two models are equivalent is a
+different question, and requires a different tool: **TOST** (two one-sided tests). You declare
+an equivalence margin δ — say, half a percentage point of accuracy — and test both
+`H₀: diff ≤ −δ` and `H₀: diff ≥ +δ`. Rejecting both licenses the claim "the difference is
+smaller than δ". Simply failing to reject a two-sided null does not, because an underpowered
+test fails to reject almost everything.
+
+Here the bootstrap CI happens to be tight, `[-0.17pp, +0.23pp]`, so a δ of 0.5pp *would*
+plausibly clear — but that is a CI argument, not the test we ran. **TOST is not implemented.**
+
+The framework already warns about this pattern: it printed *"only 9 discordant pairs — the
+models rarely disagree, so this comparison rests on very little evidence"*, which is precisely
+the situation where a null result is least informative.
+
+### 8.7 Multiple comparisons — a limitation to own
 
 Running many model comparisons inflates family-wise error: at α=0.05, testing 20 challengers
 yields ~64% chance of at least one false positive. This project does **not** currently apply
@@ -636,7 +656,44 @@ The lesson generalises: "4× smaller" and "4× faster" are different claims requ
 measurements, and quantisation only delivers the second when the runtime has a kernel for the
 ops it produces.
 
-Static quantisation is the correct fix and is not yet built.
+### Static quantisation — built, measured, and still not deployed
+
+`cropguard.serving.quantize` implements the correct approach: calibrate activation ranges up
+front on real images, then emit `QLinearConv`.
+
+| | fp32 | dynamic INT8 | **static INT8** |
+|---|---|---|---|
+| Size | 94.3 MB | 23.8 MB | 23.8 MB |
+| Latency (batched, i5-12450H) | **24.4 ms** | 1569 ms | 78.0 ms |
+| Conv op | `Conv` × 53 | `ConvInteger` × 53 | **`QLinearConv` × 53** |
+| Requantise nodes | — | 50 × `DynamicQuantizeLinear` | 1 × `QuantizeLinear` |
+| Accuracy (n=3000) | 0.9893 | — | 0.9897 (+0.0003, n.s.) |
+
+**20× faster than dynamic. Still 3.2× slower than fp32.** The reason is the hardware:
+
+```
+12th Gen Intel Core i5-12450H
+  avx2 YES   fma YES   avx512_vnni -   avx_vnni -
+```
+
+INT8 convolution needs a **VNNI** dot-product instruction to beat fp32. Without one, ONNX
+Runtime emulates each INT8 MAC with several AVX2 instructions, while fp32 runs on well-tuned
+FMA GEMM kernels. **INT8 is not universally faster — it is faster on hardware with INT8
+instructions.**
+
+This is why the benchmark above does not settle the deployment question: it was run on the
+wrong machine. Server CPUs (Xeon Cascade Lake and later, AMD Zen 4) generally *do* have
+AVX-512 VNNI, where static INT8 would likely win on both size and speed. **The measurement
+that decides is the one taken on the deployment target**, and that is not yet done.
+
+Accuracy is unaffected: the two models disagreed on **9 of 3000** images. Note carefully what
+that does and does not establish — see §8.7.
+
+**Calibration uses the validation split, never test.** The holdout decides whether a model
+ships; letting it shape how the model is built would contaminate that decision. The
+calibration sample is also spread evenly across classes rather than drawn at random, because
+activation ranges are set by the extremes a layer sees and a random draw from a 36×-imbalanced
+split would barely touch the rare classes.
 
 ### 9.4 The two traps
 
