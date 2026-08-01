@@ -7,13 +7,13 @@ and the reasoning you would need to defend under hard questioning from a senior 
 breaks*.
 
 **Scope note:** only built components are covered. **DVC is deliberately absent** — it is not
-in this project yet, so there is nothing here to defend. Likewise no MLflow, sweeps,
-calibration, drift detection, or Render deployment. Claiming those in an interview when the
-repo does not contain them is exactly the trap this document exists to avoid.
+in this project yet, so there is nothing here to defend. Likewise no MLflow, hyperparameter
+sweeps, calibration, drift detection, or the ConvNeXt challenger. Claiming those in an
+interview when the repo does not contain them is exactly the trap this document exists to
+avoid.
 
-**Results are now real.** The baseline is trained; §0 records what it achieved and what that
-does and does not license you to claim. Everything beyond the baseline — sweeps, the
-challenger, calibration — is still unbuilt, so do not describe it as done.
+**Results are real and the API is live** (§0, §11). Everything beyond the trained baseline and
+its deployment is still unbuilt, so do not describe it as done.
 
 ---
 
@@ -30,6 +30,26 @@ ResNet50, 12 epochs, leaf-grouped split, evaluated on the 8,125-image holdout:
 
 Read **macro-F1**, not accuracy: at 36× imbalance accuracy is dominated by the largest
 classes (§4).
+
+### Live deployment
+
+**https://cropguard-api-w9ch.onrender.com** — Render free tier, Docker, weights baked in from
+HF Hub at build time. `/health` reports `healthy`, model version `resnet50-baseline-grouped-v1`.
+
+Six test-set images across six classes: **6/6 correct**. And the number that matters:
+
+| Environment | Median inference | CPU |
+|---|---|---|
+| Local | **24 ms** | i5-12450H, full cores |
+| **Render free tier** | **3504 ms** | **0.1 vCPU** |
+
+**146× slower in production than on a laptop.** Nothing is wrong — Render's free tier
+allocates one tenth of a core, and ResNet50 at 224×224 is ~4 GFLOPs of work. The lesson is
+that a latency figure without its hardware is meaningless, and the only benchmark that counts
+is the one taken on the deployment target. See §11.
+
+**Do not quote sub-second latency for this deployment.** The honest number is ~3.5 s/image on
+the free tier.
 
 ### The leakage result — and a hypothesis that did not survive
 
@@ -384,6 +404,33 @@ probabilities systematically understate. Since calibration (ECE, temperature sca
 planned work, this interaction must be handled: **temperature scaling should be fitted after
 training, on the validation set, against the smoothed model.** Anyone asking about calibration
 should hear that these two choices interact.
+
+#### This is visible in production, and it is a good story
+
+At the smoothed optimum the softmax output for the correct class approaches
+
+  `(1 − ε) + ε/K  =  0.9 + 0.1/38  =  0.9026`
+
+Confidences returned by the live API on six correct predictions:
+
+```
+0.9049   0.9022   0.9026   0.9139   0.8972      (median ≈ 0.9025)
+```
+
+Sitting exactly on the theoretical ceiling. **The model is structurally incapable of reporting
+more than ~90% confidence**, and this is a *deliberate consequence of the loss function*, not
+a sign of uncertainty about the image.
+
+Two things follow:
+
+1. A user seeing "90% confident" on an image the model is certain about is being misled. The
+   number needs recalibrating before it is shown as a probability.
+2. It confirms the model trained as intended — the observed ceiling matching the closed-form
+   prediction to three decimal places is a strong check that the loss did what the maths says.
+
+If asked *"is your model well calibrated?"*: no, and predictably not — label smoothing caps
+confidence by construction, so it is systematically under-confident. The fix is temperature
+scaling fitted on validation, and it is not built yet.
 
 ### 7.2 Optimisation
 
@@ -792,9 +839,69 @@ distribution — observable without any ground-truth labels.
 here; labelling by user or image ID would explode the time-series count and take down
 Prometheus. Cardinality discipline is a real production concern.
 
+Confirmed working in production — all three instruments record, and the confidence histogram
+is what surfaced the label-smoothing ceiling in §7.1.
+
 ---
 
-## 11. CI/CD — what is actually built
+## 11. Deployment, and what production latency actually taught us
+
+Live at **https://cropguard-api-w9ch.onrender.com** — Render free tier, Docker built from
+`render.yaml`, weights baked into the image at build time from HF Hub.
+
+### The measurement
+
+| Environment | CPU | Median inference |
+|---|---|---|
+| Local benchmark | i5-12450H, all cores | **24 ms** |
+| Render free tier | **0.1 vCPU** | **3504 ms** |
+
+**146×.** Nothing is broken. ResNet50 at 224×224 is ~4 GFLOPs per image; on a tenth of a core
+that is simply what it costs. Render's free tier is not sized for CNN inference.
+
+### Why this matters more than the number
+
+Three claims about this model have now been measured, and **each one changed on different
+hardware**:
+
+| Claim | Laptop | Render |
+|---|---|---|
+| fp32 latency | 24 ms | 3504 ms |
+| INT8 vs fp32 | INT8 3.2× *slower* (no VNNI) | unknown |
+| Model size | irrelevant | matters — 512MB RAM cap |
+
+The generalisable lesson: **a performance number without its hardware is not a result.** The
+INT8 decision in §9 was left open precisely because the laptop benchmark could not settle it,
+and this deployment shows why that caution was right — the production environment differs from
+the dev machine on the exact axis the decision depends on.
+
+### What would actually make this fast
+
+In rough order of effect:
+
+1. **A paid instance.** 0.1 → 1 vCPU is a ~10× win for $7/month and no engineering.
+2. **A smaller backbone.** ResNet50 (4.1 GFLOPs) → MobileNetV3 (~0.22 GFLOPs) is ~18× fewer
+   operations. On a dataset this easy the accuracy cost is likely small — a genuinely good
+   experiment, and better ML work than fighting the runtime.
+3. **Static INT8**, *if* Render's CPU has VNNI. Unmeasured; worth testing since the artifact
+   already exists.
+4. **Smaller input.** 224 → 160 px is ~2× fewer FLOPs, at some accuracy cost.
+
+Note that (2) is the one an ML engineer should reach for first. Serving a 25.6M-parameter
+ResNet50 to classify leaves that a 5M-parameter network can probably handle is the actual
+inefficiency; quantisation is tuning around a model that is oversized for the task.
+
+### Free-tier behaviour to be honest about
+
+- **Sleeps after 15 minutes idle**, so the first request afterwards pays ~50 s of cold start
+  on top of inference.
+- **512 MB RAM** with a 94 MB fp32 model plus ONNX Runtime — it fits, without much headroom.
+- Weights are **baked into the image**, not fetched at boot, specifically so a sleeping
+  instance does not re-download 94 MB on every wake.
+
+---
+
+## 12. CI/CD — what is actually built
 
 Three jobs on push and PR:
 
@@ -821,7 +928,7 @@ nothing wires it into a workflow yet.
 
 ---
 
-## 12. The hard questions
+## 13. The hard questions
 
 **"Everyone gets 99% on PlantVillage. What did you actually add?"**
 A holdout you can trust, and the measurement showing whether it mattered. I found that 74.2%
@@ -885,6 +992,27 @@ After that: `uncertainty` is predictive entropy rather than genuine epistemic un
 confidence is uncalibrated and label smoothing makes it systematically under-confident; there
 is no multiple-comparisons correction once sweeps begin; and eight classes have fewer than 100
 test images, so their per-class metrics are too noisy to act on.
+
+**"Your API takes 3.5 seconds per prediction. Is that acceptable?"**
+Not for an interactive product, and I would not claim otherwise. It is Render's free tier at
+0.1 vCPU running a 4-GFLOP ResNet50 - the same model is 24 ms on a laptop, so the 146x gap is
+allocated compute, not a bug. The fix I would reach for first is not quantisation but a
+smaller backbone: MobileNetV3 is ~18x fewer FLOPs, and on a dataset this easy the accuracy
+cost is probably small. Serving a 25.6M-parameter network to classify leaves a 5M-parameter
+one can handle is the actual inefficiency.
+
+**"Why didn't you know it would be slow before deploying?"**
+I benchmarked on my laptop and got 24 ms, which is the mistake. Every performance claim in
+this project has now changed on different hardware - fp32 latency, INT8 versus fp32, whether
+model size matters at all. That is exactly why the INT8 decision in §9 was left open rather
+than settled on a laptop benchmark, and the deployment confirmed that caution was right.
+
+**"Your model reports 90% confidence on everything. Why?"**
+Label smoothing at 0.1 over 38 classes caps the achievable softmax output at
+(1-eps) + eps/K = 0.9026, and the live API returns a median of 0.9025. That is the loss
+function doing what it is designed to do, not the model being unsure. It also means the
+confidence value should not be shown to a user as a probability until it is recalibrated -
+temperature scaling on the validation set is the fix, and it is not built yet.
 
 **"You're at 99.11%. What would you do next?"**
 Nothing aimed at the accuracy number — the headroom is 0.9% and the remaining errors are

@@ -4,8 +4,10 @@ Production MLOps pipeline for crop disease detection — 38-class leaf classifie
 PlantVillage, served as a CPU-only ONNX API with experiment tracking, statistical A/B testing,
 and drift monitoring. Runs entirely on free tiers.
 
-> **Status: baseline trained and evaluated.** Deployment, calibration and the challenger model
-> are still open — see [Roadmap](#roadmap).
+> **Live API: https://cropguard-api-w9ch.onrender.com** — `/health` · `/predict` · `/metrics`
+>
+> **Status: baseline trained, evaluated and deployed.** Calibration, the challenger model and
+> drift detection are still open — see [Roadmap](#roadmap).
 
 ## Results
 
@@ -37,6 +39,21 @@ pairs: corn *Cercospora ↔ Northern Leaf Blight*, and tomato *Early ↔ Late bl
 `Potato___healthy` has only 24 test images, so its 0.833 recall is four mistakes with a ±15pp
 confidence interval — eight classes fall below 100 test images and their per-class numbers
 should not be read as precise.
+
+### Production latency — measured, not estimated
+
+| Environment | CPU | Median inference |
+|---|---|---|
+| Local benchmark | i5-12450H, all cores | **24 ms** |
+| **Render free tier** | **0.1 vCPU** | **3504 ms** |
+
+146×. Nothing is broken — ResNet50 at 224×224 is ~4 GFLOPs and the free tier allocates a tenth
+of a core. It is stated here rather than buried because a latency number without its hardware
+is not a result, and every performance claim in this project changed between the two machines.
+
+The first fix worth trying is a **smaller backbone**, not quantization: MobileNetV3 is ~18×
+fewer FLOPs, and on a dataset this easy the accuracy cost is likely small. Serving a
+25.6M-parameter ResNet50 to classify leaves is the actual inefficiency.
 
 ## Architecture
 
@@ -133,6 +150,12 @@ deployable before the first model exists.
 
 `uncertainty` is currently normalized predictive entropy in [0, 1]; MC-dropout and ensemble
 variance land with the calibration work.
+
+**Confidence is capped at ~0.90 by design.** Label smoothing (ε=0.1, K=38) bounds the
+achievable softmax output at `(1−ε) + ε/K = 0.9026`, and live predictions sit exactly there
+(median 0.9025). That is the loss function working as intended, not model uncertainty — but it
+means `confidence` should not be read as a calibrated probability until temperature scaling is
+fitted. See [`brain.md`](brain.md) §7.1.
 
 ### Configuration
 
@@ -279,7 +302,8 @@ guard against training/serving skew.
 - [x] Hypothesis testing: McNemar, bootstrap CI, Cohen's d, power analysis
 - [x] Train the ResNet50 baseline (99.11% / 0.9865 macro-F1, leak-free holdout)
 - [x] Leakage ablation: measured, and the inflation is not there
-- [ ] Publish weights to HF Hub, deploy to Render
+- [x] Publish weights to HF Hub ([`XiElonMAsk/cropguard-models`](https://huggingface.co/XiElonMAsk/cropguard-models))
+- [x] Deploy to Render — live, with real latency measured
 - [ ] ConvNeXt-Tiny challenger and the first real A/B comparison
 - [ ] Calibration: temperature scaling, ECE, reliability diagrams, MC-dropout uncertainty
 - [ ] Error and subgroup analysis (lab vs. field photos)

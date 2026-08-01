@@ -21,11 +21,12 @@ marked superseded, so the reasoning trail stays intact.
 | **Tests** | 101 passing, ruff clean |
 | **Dataset** | 54,305 images / 38 classes at `C:\cropguard-data` (outside OneDrive) |
 | **Repo** | github.com/abhinav7289A/CropGuard |
+| **Live API** | https://cropguard-api-w9ch.onrender.com |
 | **Models** | `XiElonMAsk/cropguard-models` on HF Hub |
 
 **Not yet built:** EDA notebook, duplicate detection, DVC, MLflow registry, hyperparameter
 sweeps, augmentation/transfer-learning ablations, calibration, bias analysis, `/feedback`
-endpoint, drift detection, Grafana, live Render deployment, load testing.
+endpoint, drift detection, Grafana, load testing, ConvNeXt challenger.
 
 ### The headline finding so far
 
@@ -365,6 +366,39 @@ misattributes a cause is worse than no log at all.
 ---
 
 ## 5. Change log
+
+### 2026-08-02 — Deployed, and production latency is 146x the laptop benchmark
+
+**Live: https://cropguard-api-w9ch.onrender.com** (Render free tier, Docker from
+`render.yaml`, weights baked into the image at build time). `/health` healthy, 6/6 correct on
+test-set images across six classes, all three Prometheus instruments recording.
+
+| Environment | CPU | Median inference |
+|---|---|---|
+| Local | i5-12450H, all cores | **24 ms** |
+| Render free tier | **0.1 vCPU** | **3504 ms** |
+
+Nothing is broken - ResNet50 at 224x224 is ~4 GFLOPs, and a tenth of a core takes that long.
+But it makes a point worth internalising: **every performance claim in this project has now
+changed on different hardware.** fp32 latency, INT8-versus-fp32, whether model size matters at
+all. This is exactly why the INT8 decision was left open on a laptop benchmark rather than
+settled by one.
+
+**Do not quote sub-second latency.** The honest figure is ~3.5 s/image on the free tier. The
+first fix worth trying is not quantisation but a smaller backbone - MobileNetV3 is ~18x fewer
+FLOPs, and on a dataset this easy the accuracy cost is likely small.
+
+**A theoretical prediction confirmed in production telemetry.** Live confidences: 0.9049,
+0.9022, 0.9026, 0.9139, 0.8972 - median 0.9025. Label smoothing at eps=0.1 over K=38 caps the
+achievable softmax output at exactly `(1-eps) + eps/K = 0.9026`. The model is *structurally
+incapable* of reporting more than ~90% confidence, by design of the loss.
+
+Two consequences: the confidence value must not be shown to a user as a probability until it
+is recalibrated (temperature scaling, not yet built), and the ceiling matching the closed form
+to three decimals is strong evidence the loss behaved as the maths says. See brain.md 7.1.
+
+**brain.md restructured** for this: new 11 on deployment, hard questions added on production
+latency and the confidence ceiling, sections renumbered.
 
 ### 2026-08-01 (phase B) — Static quantisation: built, measured, not deployed
 
