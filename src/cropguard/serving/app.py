@@ -28,7 +28,9 @@ class Settings(BaseSettings):
     # protected_namespaces=() so pydantic permits the model_* field names used by the env vars.
     model_config = SettingsConfigDict(env_prefix="CROPGUARD_", protected_namespaces=())
 
-    model_path: Path = Path("models/cropguard.int8.onnx")
+    # fp32 by default: dynamically-quantized INT8 rewrites Conv into ConvInteger, which ONNX
+    # Runtime's CPU backend has no optimized kernel for (measured 1567 ms/img vs 19 ms/img).
+    model_path: Path = Path("models/cropguard.onnx")
     classes_path: Path = Path("configs/classes.json")
     model_version: str = "v0.1.0-baseline"
     cors_origins: str = "http://localhost:5173"  # comma-separated

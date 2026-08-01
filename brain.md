@@ -11,10 +11,94 @@ in this project yet, so there is nothing here to defend. Likewise no MLflow, swe
 calibration, drift detection, or Render deployment. Claiming those in an interview when the
 repo does not contain them is exactly the trap this document exists to avoid.
 
-**Also absent: results.** No model has been trained. Architecture and training theory below
-describe what *will* run, not what has. Say so plainly if asked — "the pipeline is verified end
-to end but the baseline has not been trained yet" is a fine answer; inventing an accuracy
-number is not.
+**Results are now real.** The baseline is trained; §0 records what it achieved and what that
+does and does not license you to claim. Everything beyond the baseline — sweeps, the
+challenger, calibration — is still unbuilt, so do not describe it as done.
+
+---
+
+## 0. Results
+
+ResNet50, 12 epochs, leaf-grouped split, evaluated on the 8,125-image holdout:
+
+| Metric | Value |
+|---|---|
+| Test accuracy | **0.9911** |
+| Test macro-F1 | **0.9865** |
+| Best val macro-F1 | 0.9926 (epoch 11) |
+| Test leakage | **0.0%** of resolvable leaves shared with train |
+
+Read **macro-F1**, not accuracy: at 36× imbalance accuracy is dominated by the largest
+classes (§4).
+
+### The leakage result — and a hypothesis that did not survive
+
+The project was built on the expectation that removing 74.2% leaf leakage would *lower*
+accuracy, and that the drop would be the honest number. It did not happen:
+
+| Split | Leakage | Best val macro-F1 |
+|---|---|---|
+| Grouped | 0.0% | **0.9926** |
+| Naive stratified | 74.2% | 0.9921 |
+
+The contaminated split scored **marginally lower**. These are different validation sets so it
+is not a clean paired comparison, but the direction contradicts leakage-inflation and the gap
+is noise.
+
+**What this means, stated carefully.** PlantVillage is genuinely easy — uniform backgrounds,
+single centred leaf, controlled lighting — so a model has ample non-leaf signal and does not
+need to memorise leaf identity. Published ~99% figures on this dataset appear to be largely
+real, not artifacts.
+
+**What it does not mean.** Grouping was not wasted. You cannot know the size of a leakage
+effect without measuring it, and every statistic downstream — every McNemar test, every
+bootstrap CI — is only meaningful on a holdout you can trust. Measuring the effect and finding
+it small is a result; assuming it away is not.
+
+If asked "so your big finding was nothing?": the finding is that *the standard split's leakage
+does not materially inflate results on this dataset*, which is a claim nobody had checked, and
+it took the grouped split to establish it.
+
+### Reproducibility — measured, not claimed
+
+Training ran on a Colab T4. The checkpoint was later exported and evaluated on a Windows CPU
+machine. The two agree to **16 decimal places**: 0.9911384615384615 accuracy,
+0.9865412130517314 macro-F1, on both.
+
+Worth being able to explain *why*, because "it's reproducible" is cheap to say and each piece
+here is a deliberate choice:
+
+1. **The split is regenerated, not copied.** Deterministic from `seed: 42`, the sorted file
+   listing and `leaf-map.json`, then SHA-256 verified. So the 8,125 holdout images are the
+   same images, in the same order, without moving 2.2GB between machines.
+2. **`classes.json` fixes label order** across training, export and serving. If label order
+   drifted, predictions would map to the wrong disease names with no error raised anywhere.
+3. **ONNX inference is deterministic**, and the export gate holds the graph to <1e-3 against
+   PyTorch (measured 3.58e-06).
+4. **Preprocessing is pinned.** Serving reimplements torchvision's transforms in NumPy (§10.2);
+   `test_preprocess.py` holds the two together. Unpinned, a resize-kernel difference would
+   shift results by a fraction of a percent — enough to break bit-identity, small enough to
+   never look like a bug.
+
+Break any one and the numbers drift silently. The identity across two operating systems and
+two processor architectures is evidence all four hold.
+
+### Where the errors actually are
+
+~72 misclassifications out of 8,125, concentrated in two biologically plausible confusion
+pairs:
+
+- **Corn: Cercospora / Gray leaf spot ↔ Northern Leaf Blight** (F1 0.940 / 0.970)
+- **Tomato: Early blight ↔ Late blight** (F1 0.944 / 0.964)
+
+Both pairs are genuinely hard for human agronomists too. That is a far better answer to "what
+does your model get wrong" than a single accuracy figure.
+
+**One caveat to state before anyone else spots it.** `Potato___healthy` shows recall 0.833 —
+but its support is **24 images**, so that is four mistakes, and the 95% CI spans roughly ±15
+points. Eight classes have fewer than 100 test images. The `min_samples_per_class: 100`
+validation gate checks the *total*, and 15% of 100 is 15 test images; for per-class test
+metrics with usable error bars the gate should be on split size, not total (§2).
 
 ---
 
@@ -512,15 +596,47 @@ For **symmetric** per-tensor weight quantisation (z = 0):
   `s = max|r| / 127`,  `q = clip(round(r/s), −127, 127)`
 
 **Dynamic** means weights are quantised ahead of time, but activation scales are computed at
-runtime per batch — no calibration dataset needed, unlike static quantisation. The trade-off
-is a small per-inference cost to compute activation ranges, in exchange for robustness to
-distribution shift in inputs.
+runtime per batch — no calibration dataset needed, unlike static quantisation.
 
-Measured: **32.2MB → 8.1MB**, ~4×, as expected from 32-bit → 8-bit weights.
+Measured: **94.3MB → 23.8MB**, ~4×, as expected from 32-bit → 8-bit weights.
 
-Accuracy impact is small because weight distributions per layer are roughly unimodal and
-centred, so 256 levels capture them well — but it is **not** zero, which is why the test suite
-asserts the INT8 and fp32 probability vectors stay within 0.1 max absolute difference.
+### The mistake worth being able to explain
+
+Dynamic quantisation was the **wrong choice for this model**, and the served artifact is fp32.
+
+| | fp32 | dynamic INT8 |
+|---|---|---|
+| Size | 94.3 MB | 23.8 MB |
+| Latency (Intel Alder Lake CPU) | **19 ms/img** | **1567 ms/img** |
+
+A **75× regression**. The graph shows why:
+
+| Graph | Ops |
+|---|---|
+| fp32 | 53 × `Conv` |
+| INT8 | 53 × `ConvInteger`, 50 × `DynamicQuantizeLinear`, 108 × `Mul`, 54 × `Cast` |
+
+`quantize_dynamic` rewrote every convolution into `ConvInteger`, and **ONNX Runtime's CPU
+backend has no optimised kernel for `ConvInteger`** — it falls back to a reference
+implementation. On top of that, 50 `DynamicQuantizeLinear` nodes recompute activation ranges
+on *every* inference.
+
+**The underlying principle:** dynamic quantisation is designed for **MatMul-dominated**
+architectures — Transformers, RNNs — where weights dominate memory and activations are cheap
+to quantise on the fly. A **Conv-dominated CNN** needs **static** quantisation with a
+calibration set, which emits `QLinearConv`, a properly optimised kernel. Dynamic quantisation
+of Conv layers is a known ONNX Runtime anti-pattern.
+
+**Why this went unnoticed:** the size reduction was measured and real, and the accuracy check
+passed (`test_onnx_export.py` bounds the probability difference at 0.1). Latency was never
+measured — it was assumed to follow from the smaller weights. Every claim in the pipeline was
+verified *except* the one that mattered for serving.
+
+The lesson generalises: "4× smaller" and "4× faster" are different claims requiring different
+measurements, and quantisation only delivers the second when the runtime has a kernel for the
+ops it produces.
+
+Static quantisation is the correct fix and is not yet built.
 
 ### 9.4 The two traps
 
@@ -650,12 +766,19 @@ nothing wires it into a workflow yet.
 
 ## 12. The hard questions
 
-**"Your test accuracy will be lower than published PlantVillage results. Why should I care
-about your model?"**
-Published results are mostly measured on leaked splits. I measured the leakage: 74.2% of test
-images shared a physical leaf with training. My number is lower because it is measured on a
-holdout with zero leaf overlap. The comparison is not like-for-like — and I can produce both
-numbers, since `--strategy stratified` is retained precisely to quantify that gap.
+**"Everyone gets 99% on PlantVillage. What did you actually add?"**
+A holdout you can trust, and the measurement showing whether it mattered. I found that 74.2%
+of test images shared a physical leaf with training under the standard split, rebuilt the
+split grouped by leaf, and still got 99.11%. So the published figures hold up — but that was
+not knowable in advance, and a trustworthy holdout is the precondition for every statistical
+claim downstream. The contribution is the measurement, not a bigger number.
+
+**"You predicted accuracy would drop and it didn't. Doesn't that make the work pointless?"**
+No — it makes it a result. "PlantVillage numbers are inflated by near-duplicates" went from an
+unmeasured assumption to a measured, and false, one. I would rather report that than quietly
+drop an experiment for failing to confirm what I expected. The grouped split still has to
+exist regardless: a 74%-contaminated holdout would make the whole A/B framework answer the
+wrong question, whichever way the numbers fell.
 
 **"How do you know your grouped split didn't just make the task artificially hard?"**
 It cannot. It removes images from train, but each test image is still a real image of a real
@@ -681,10 +804,13 @@ audit of it. What I can say is that it produced 20,015 groups with zero class-sp
 violations, which is a consistency signal — a random or corrupted mapping would not exhibit
 that structure.
 
-**"Your INT8 model differs from fp32. How do you know it's safe to deploy?"**
-The test suite bounds max absolute probability difference at 0.1, and the export gates fp32
-against PyTorch at 1e-3. But I have **not** yet measured INT8 accuracy on the full holdout —
-that is the correct check and it is not done. That is the honest gap.
+**"You quantised to INT8 and then didn't ship it. What happened?"**
+I measured latency and it was 75x *slower* - 1567 ms/image against 19 ms for fp32. Dynamic
+quantisation rewrites Conv into ConvInteger, which ONNX Runtime's CPU backend has no optimised
+kernel for. It suits MatMul-heavy models, not CNNs; the right tool here is static quantisation
+emitting QLinearConv. I had verified the size reduction and the accuracy delta but never the
+latency - I had assumed it followed from smaller weights. It is the one claim in the pipeline
+I did not measure, and it was the one that mattered for serving.
 
 **"You monitor macro-F1 but train on plain cross-entropy. Isn't that a mismatch?"**
 Yes, and it is a real one. The loss is support-weighted while the selection metric is not, so
@@ -693,7 +819,19 @@ loss or balanced sampling would align them; neither is implemented yet. Currentl
 acts only as a *selection* criterion, not a *training* signal.
 
 **"What's the weakest part of this project?"**
-That no model is trained yet, so every number about model quality is hypothetical. After that:
-uncertainty is entropy rather than genuine epistemic uncertainty; there is no correction for
-multiple comparisons once sweeps begin; and nothing enforces that the serving package stays
-torch-free, which is the invariant the whole deployment rests on.
+That the model has only ever seen lab photographs. 99.11% on PlantVillage says nothing about a
+phone picture taken in a field, and the literature on this dataset reports large drops there.
+Until that gap is measured, the accuracy figure describes a benchmark, not the problem the
+project claims to address.
+
+After that: `uncertainty` is predictive entropy rather than genuine epistemic uncertainty;
+confidence is uncalibrated and label smoothing makes it systematically under-confident; there
+is no multiple-comparisons correction once sweeps begin; and eight classes have fewer than 100
+test images, so their per-class metrics are too noisy to act on.
+
+**"You're at 99.11%. What would you do next?"**
+Nothing aimed at the accuracy number — the headroom is 0.9% and the remaining errors are
+genuinely ambiguous disease pairs. The useful work is measuring where it *fails*: field
+photographs versus lab images, calibration, and per-class reliability for the rare diseases.
+Chasing 99.11% → 99.4% on a saturated benchmark would be optimising the metric rather than the
+problem.

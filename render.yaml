@@ -54,7 +54,7 @@ services:
         value: resnet50-baseline-grouped-v1
 
       - key: CROPGUARD_MODEL_PATH
-        value: /app/models/cropguard.int8.onnx
+        value: /app/models/cropguard.onnx
 
       - key: CROPGUARD_CLASSES_PATH
         value: /app/configs/classes.json
@@ -66,11 +66,11 @@ services:
       - key: CROPGUARD_MAX_UPLOAD_MB
         value: "10"
 
-      # HF Hub repo holding cropguard.int8.onnx, pulled at startup by fetch_model.py.
-      # Left unset, the API still deploys — it just reports "degraded" until a model exists.
+      # HF Hub repo holding the weights. Baked in at build time via the Dockerfile ARG
+      # default; this runtime copy is the fallback if the build-time fetch failed.
       # Note this is the HuggingFace namespace, which is not the same as the GitHub one.
       - key: CROPGUARD_HF_REPO
         value: XiElonMAsk/cropguard-models
 
       - key: CROPGUARD_MODEL_FILE
-        value: cropguard.int8.onnx
+        value: cropguard.onnx

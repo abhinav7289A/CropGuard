@@ -15,16 +15,31 @@ marked superseded, so the reasoning trail stays intact.
 
 | | |
 |---|---|
-| **Critical path** | Week 1, end of Day 3 — data acquired, validated, split |
-| **Blocker** | Day 6–7 baseline training. Nothing downstream is real until a model exists |
+| **Critical path** | Week 1 Day 6–7 complete — **baseline trained** |
+| **Baseline** | ResNet50, **99.11% test accuracy / 0.9865 macro-F1** on the leak-free holdout |
 | **Built ahead of schedule** | Week 3 A/B testing, most of Week 4 serving |
-| **Tests** | 81 passing, ruff clean |
+| **Tests** | 96 passing, ruff clean |
 | **Dataset** | 54,305 images / 38 classes at `C:\cropguard-data` (outside OneDrive) |
-| **Repo** | github.com/abhinav7289A/CropGuard, commit `0b12e1d` |
+| **Repo** | github.com/abhinav7289A/CropGuard |
+| **Models** | `XiElonMAsk/cropguard-models` on HF Hub |
 
 **Not yet built:** EDA notebook, duplicate detection, DVC, MLflow registry, hyperparameter
 sweeps, augmentation/transfer-learning ablations, calibration, bias analysis, `/feedback`
-endpoint, drift detection, Grafana, Render deployment, load testing.
+endpoint, drift detection, Grafana, live Render deployment, load testing.
+
+### The headline finding so far
+
+The leaf-grouped split removed **74.2% test leakage** — and accuracy did **not** drop. Best
+validation macro-F1 was **0.9926 on the grouped split** versus **0.9921 on the naive one**, so
+the contaminated split scored marginally *lower*. Different validation sets, so not a clean
+comparison, but the direction is the opposite of what leakage-inflation predicts and the gap
+is noise-level.
+
+The honest reading: **PlantVillage is genuinely an easy dataset**, not one whose published
+~99% figures are mostly a leakage artifact. The grouping work was still correct — you cannot
+know that without measuring, and every downstream statistic depends on a trustworthy holdout —
+but the expected inflation is not there. Recorded because the original hypothesis in §3.4 was
+that accuracy would fall, and it did not.
 
 ---
 
@@ -346,6 +361,39 @@ misattributes a cause is worse than no log at all.
 ---
 
 ## 5. Change log
+
+### 2026-08-01 — Baseline trained, and the pipeline proved reproducible across machines
+
+**Baseline results.** ResNet50, 12 epochs, leaf-grouped split, 8,125-image holdout:
+**0.9911 accuracy / 0.9865 macro-F1**, best val macro-F1 0.9926 at epoch 11.
+
+**The leakage hypothesis did not survive contact with data.** See §1 — grouping removed 74.2%
+leakage and accuracy did not fall. Left recorded rather than quietly dropped: an experiment
+that fails to confirm its hypothesis is still a result, and this one says something real about
+the dataset.
+
+**Reproducibility, measured rather than asserted.** Training ran on a Colab T4; the checkpoint
+was then exported and evaluated on a Windows CPU box. The two runs agree **to 16 decimal
+places**:
+
+```
+Colab  : 0.9911384615384615 accuracy / 0.9865412130517314 macro-F1
+Windows: 0.9911384615384615 accuracy / 0.9865412130517314 macro-F1
+```
+
+That is not a coincidence, and it is worth understanding *why* it holds, because each piece is
+a deliberate design decision:
+
+- the split is regenerated from `seed: 42` and hash-verified, not copied
+- `classes.json` fixes label order across training, export and serving
+- ONNX inference is deterministic, and the parity gate (3.58e-06 here) keeps the exported
+  graph faithful to PyTorch
+- preprocessing is pinned against torchvision by `test_preprocess.py`
+
+Break any one of those and the numbers drift silently. This is the payoff for the
+training/serving skew work in §3.8.
+
+**Export figures.** fp32 94.3MB → INT8 23.8MB (4.0×), parity 3.58e-06 against PyTorch.
 
 ### 2026-08-01 — Lightning AI support, HF publishing
 

@@ -28,9 +28,17 @@ COPY scripts/fetch_model.py scripts/fetch_model.py
 # NOTE: do not reintroduce `COPY models*/ models/` here. models/ is gitignored, so it does
 # not exist in a clean checkout, and a COPY whose glob matches nothing fails the build
 # outright rather than being skipped.
-ARG CROPGUARD_HF_REPO=""
-ARG CROPGUARD_MODEL_FILE="cropguard.int8.onnx"
-ENV CROPGUARD_MODEL_PATH=/app/models/cropguard.int8.onnx
+# Defaults rather than required build args: Render never forwards Blueprint env vars into the
+# build, so a default is the only way to bake the weights in there. Override locally with
+# --build-arg when testing a different model.
+#
+# fp32, not INT8: dynamic quantization rewrites every Conv into ConvInteger, which ONNX
+# Runtime's CPU backend has no optimized kernel for. Measured 1567 ms/img against 19 ms/img
+# for fp32 - a 75x regression in exchange for 4x less disk. Static quantization (QLinearConv)
+# is the correct fix and is not built yet.
+ARG CROPGUARD_HF_REPO="XiElonMAsk/cropguard-models"
+ARG CROPGUARD_MODEL_FILE="cropguard.onnx"
+ENV CROPGUARD_MODEL_PATH=/app/models/cropguard.onnx
 RUN mkdir -p models && \
     if [ -n "$CROPGUARD_HF_REPO" ]; then \
         CROPGUARD_HF_REPO="$CROPGUARD_HF_REPO" \

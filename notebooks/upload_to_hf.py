@@ -36,12 +36,10 @@ if int8_path.exists():
     int8 = load_predictions(int8_path)
     acc8 = float(int8["correct"].mean())
     f1_8 = float(f1_score(int8["labels"], int8["predictions"], average="macro"))
-    int8_row = (
-        f"| INT8 (served) | {acc8:.4f} | {f1_8:.4f} | {(acc8 - acc32) * 100:+.2f} pp vs fp32 |"
-    )
+    int8_row = f"| INT8 (dynamic) | {acc8:.4f} | {f1_8:.4f} | not served - see below |"
 else:
     acc8 = f1_8 = None
-    int8_row = "| INT8 (served) | not measured | not measured | - |"
+    int8_row = "| INT8 (dynamic) | not evaluated | not evaluated | not served - see below |"
 
 split = json.load(open(f"{DATA_DIR}/split_report.json"))
 classes = json.load(open("configs/classes.json"))
@@ -77,6 +75,14 @@ end-to-end MLOps pipeline.
 
 Macro-F1 is the metric to read here, not accuracy: the dataset is imbalanced ~36x, so accuracy
 is dominated by the largest classes.
+
+**Only `cropguard.onnx` (fp32) is published.** Dynamic INT8 quantization was tried and is
+*not* shipped: `quantize_dynamic` rewrites every `Conv` into `ConvInteger`, which ONNX
+Runtime's CPU backend has no optimized kernel for. Measured on an Intel Alder Lake CPU it ran
+at **1567 ms/image against 19 ms/image for fp32** - a 75x regression in exchange for 4x less
+disk. Dynamic quantization suits MatMul-dominated models (Transformers, RNNs), not CNNs; the
+correct approach for a Conv-heavy network is *static* quantization with a calibration set,
+which emits the optimized `QLinearConv`. That is not built yet.
 
 ## The split is grouped by leaf, and that matters
 
@@ -134,7 +140,7 @@ Checkpoint selected on `val_f1_macro`.
 import numpy as np, onnxruntime as ort
 from huggingface_hub import hf_hub_download
 
-path = hf_hub_download("{REPO_ID}", "cropguard.int8.onnx")
+path = hf_hub_download("{REPO_ID}", "cropguard.onnx")
 session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
 
 # Preprocessing must match training: resize short side to 256, centre-crop 224,
@@ -156,8 +162,10 @@ create_repo(REPO_ID, repo_type="model", exist_ok=True, token=token)
 api = HfApi()
 
 Path("MODEL_CARD.md").write_text(card, encoding="utf-8")
+# fp32 only. Publishing the dynamically-quantized INT8 file would leave a 75x-slower artifact
+# in a public repo for someone to pick up by mistake; it goes up if and when static
+# quantization makes it genuinely better.
 uploads = [
-    ("models/cropguard.int8.onnx", "cropguard.int8.onnx"),
     ("models/cropguard.onnx", "cropguard.onnx"),
     ("configs/classes.json", "classes.json"),
     ("MODEL_CARD.md", "README.md"),

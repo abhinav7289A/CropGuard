@@ -4,9 +4,39 @@ Production MLOps pipeline for crop disease detection — 38-class leaf classifie
 PlantVillage, served as a CPU-only ONNX API with experiment tracking, statistical A/B testing,
 and drift monitoring. Runs entirely on free tiers.
 
-> **Status: pipeline scaffolding complete, model not yet trained.** Every stage below runs, but
-> the numbers in the results table are placeholders until the baseline finishes training. See
-> [Roadmap](#roadmap).
+> **Status: baseline trained and evaluated.** Deployment, calibration and the challenger model
+> are still open — see [Roadmap](#roadmap).
+
+## Results
+
+ResNet50, 12 epochs, evaluated on a **leak-free** 8,125-image holdout:
+
+| Metric | Value |
+|---|---|
+| Test accuracy | **0.9911** |
+| Test macro-F1 | **0.9865** |
+| Best val macro-F1 | 0.9926 |
+| Test leaf leakage | **0.0%** |
+
+Macro-F1 is the number to read: the dataset is imbalanced ~36×, so accuracy is dominated by
+the largest classes.
+
+**The leakage result.** The standard PlantVillage split leaves 74.2% of test images sharing a
+physical leaf with training. Removing that entirely did **not** reduce accuracy — best
+validation macro-F1 was 0.9926 grouped against 0.9921 naive, i.e. the contaminated split
+scored marginally *lower*. Different validation sets, so not a paired comparison, but the
+direction is opposite to what leakage-inflation predicts.
+
+The honest conclusion is that PlantVillage is genuinely easy rather than that its published
+figures are artifacts. The grouped split still matters — a 74%-contaminated holdout would make
+every downstream statistical test answer the wrong question — but the inflation everyone
+assumes is not there. See [`brain.md`](brain.md) §0.
+
+**Where the errors are.** ~72 misclassifications, concentrated in two biologically plausible
+pairs: corn *Cercospora ↔ Northern Leaf Blight*, and tomato *Early ↔ Late blight*. Note that
+`Potato___healthy` has only 24 test images, so its 0.833 recall is four mistakes with a ±15pp
+confidence interval — eight classes fall below 100 test images and their per-class numbers
+should not be read as precise.
 
 ## Architecture
 
@@ -226,7 +256,10 @@ guard against training/serving skew.
 - [x] FastAPI serving, Prometheus metrics, Docker image
 - [x] Test suite and CI
 - [x] Hypothesis testing: McNemar, bootstrap CI, Cohen's d, power analysis
-- [ ] Train baseline + challenger, publish weights to HF Hub
+- [x] Train the ResNet50 baseline (99.11% / 0.9865 macro-F1, leak-free holdout)
+- [x] Leakage ablation: measured, and the inflation is not there
+- [ ] Publish weights to HF Hub, deploy to Render
+- [ ] ConvNeXt-Tiny challenger and the first real A/B comparison
 - [ ] Calibration: temperature scaling, ECE, reliability diagrams, MC-dropout uncertainty
 - [ ] Error and subgroup analysis (lab vs. field photos)
 - [ ] `/feedback` endpoint and drift detection (PSI, KS test) with retraining triggers
