@@ -85,7 +85,9 @@ endpoint, drift detection, Grafana, Render deployment, load testing.
 | `.gitignore` | Ignore rules — note the anchoring bug described in §4.3. |
 | `.github/workflows/ci.yml` | Three jobs: lint, test, and a Docker build + container smoke test. |
 | `scripts/fetch_model.py` | Pulls model weights from HF Hub at container start if not baked in. |
-| `notebooks/01_train_baseline_colab.ipynb` | End-to-end baseline training on a Colab T4, plus the optional leakage ablation. |
+| `notebooks/01_train_baseline.ipynb` | End-to-end baseline training. Detects Lightning AI vs Colab and sets paths accordingly. |
+| `notebooks/upload_to_hf.py` | Publishes the ONNX graphs and a generated model card to HF Hub. |
+| `render.yaml` | Render Blueprint for the deployed API. |
 
 ### Tests worth knowing about
 
@@ -345,6 +347,44 @@ misattributes a cause is worse than no log at all.
 
 ## 5. Change log
 
+### 2026-08-01 — Lightning AI support, HF publishing
+
+**Training moved to Lightning AI** (persistent filesystem, free credits). Rather than fork the
+notebook, `01_train_baseline.ipynb` now **detects its environment** and sets paths from it:
+
+| | Lightning AI | Colab |
+|---|---|---|
+| base path | `/teamspace/studios/this_studio` | `/content` |
+| filesystem | persistent | reclaimed without warning |
+| checkpoints | plain directory | symlinked to Google Drive |
+
+Hardcoding either would have broken the other, and `google.colab` does not exist on Lightning,
+so the Drive-mount cell had to become conditional rather than unconditional. `num_workers` is
+now derived from `os.cpu_count()` instead of pinned at 2 — Colab gives ~2 vCPUs, a Lightning
+studio usually more, and pinning wasted the difference.
+
+The data-download cell is now idempotent: it checks `manifest.json` and skips a 2.2GB
+re-download. That does nothing on Colab but matters on a persistent filesystem, where later
+sessions would otherwise re-fetch it every time.
+
+Renamed from `01_train_baseline_colab.ipynb` — the name was now wrong.
+
+**Added `notebooks/upload_to_hf.py`.** Publishes both ONNX graphs, `classes.json`, and a model
+card. The card is **generated from the prediction files**, not hand-written, so its numbers
+cannot drift from what the model actually produced — the standard way model cards rot. It
+records the leaf-grouped split, and states plainly that accuracy is *not* much below published
+PlantVillage figures: the dataset is easy, rather than leakage having inflated everything.
+
+**Namespaces differ across services** and this has already caused one wrong instruction:
+
+| Service | Handle |
+|---|---|
+| GitHub | `abhinav7289A` |
+| Weights & Biases | `abhinavbhatia7289` |
+| HuggingFace | `XiElonMAsk` |
+
+`CROPGUARD_HF_REPO` takes the **HuggingFace** one.
+
 ### 2026-07-31 (later still) — Docker fix and deployment config
 
 **Fixed — the Docker build was broken outright**
@@ -385,7 +425,7 @@ tier that sleeps after 15 minutes that means ~26MB re-downloaded per cold start.
 
 **Added**
 
-- `notebooks/01_train_baseline_colab.ipynb` — end-to-end T4 training: clone → download →
+- `notebooks/01_train_baseline.ipynb` — end-to-end T4 training: clone → download →
   validate → split → train → ONNX/INT8 → holdout eval. Includes an optional **leakage
   ablation** section that retrains on the naive split to quantify the accuracy inflation.
 - `tests/test_import_isolation.py` — enforces that `cropguard.serving` and

@@ -51,7 +51,7 @@ services:
       # response and tagged on every Prometheus metric, so it is how you tell which model
       # produced a given result.
       - key: CROPGUARD_MODEL_VERSION
-        value: v0.1.0-resnet50-baseline
+        value: resnet50-baseline-grouped-v1
 
       - key: CROPGUARD_MODEL_PATH
         value: /app/models/cropguard.int8.onnx
@@ -66,8 +66,11 @@ services:
       - key: CROPGUARD_MAX_UPLOAD_MB
         value: "10"
 
-      # HF Hub repo holding cropguard.int8.onnx. Set it in the Render dashboard (or here)
-      # and the Dockerfile bakes the weights in during build. Left unset, the API still
-      # deploys — it just reports "degraded" until a model is supplied.
+      # HF Hub repo holding cropguard.int8.onnx, pulled at startup by fetch_model.py.
+      # Left unset, the API still deploys — it just reports "degraded" until a model exists.
+      # Note this is the HuggingFace namespace, which is not the same as the GitHub one.
       - key: CROPGUARD_HF_REPO
-        sync: false
+        value: XiElonMAsk/cropguard-models
+
+      - key: CROPGUARD_MODEL_FILE
+        value: cropguard.int8.onnx
