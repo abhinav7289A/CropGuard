@@ -37,7 +37,7 @@ assumes is not there. See [`brain.md`](brain.md) §0.
 **Where the errors are.** ~72 misclassifications, concentrated in two biologically plausible
 pairs: corn *Cercospora ↔ Northern Leaf Blight*, and tomato *Early ↔ Late blight*. Note that
 `Potato___healthy` has only 24 test images, so its 0.833 recall is four mistakes with a ±15pp
-confidence interval — eight classes fall below 100 test images and their per-class numbers
+confidence interval — ten classes fall below 100 test images and their per-class numbers
 should not be read as precise.
 
 ### Production latency — measured, not estimated
@@ -140,7 +140,8 @@ sync on 54K small files is slow and can lock files mid-write during training.
 
 | Endpoint | Description |
 |---|---|
-| `POST /predict` | multipart image → `predicted_class`, `confidence`, `top_k`, `uncertainty`, `model_version`, `latency_ms` |
+| `POST /predict` | multipart image → `predicted_class`, `confidence`, `top_k`, `uncertainty`, `calibrated`, `model_version`, `latency_ms` |
+| `POST /predict/batch` | up to 8 images; per-image errors rather than all-or-nothing |
 | `GET /health` | `healthy` / `degraded` (model not loaded), model version, uptime |
 | `GET /metrics` | Prometheus: request counts, latency histogram, confidence histogram |
 
@@ -151,11 +152,12 @@ deployable before the first model exists.
 `uncertainty` is currently normalized predictive entropy in [0, 1]; MC-dropout and ensemble
 variance land with the calibration work.
 
-**Confidence is capped at ~0.90 by design, and the API returns it uncalibrated.** Label smoothing (ε=0.1, K=38) bounds the
+**Confidence is capped at ~0.90 in the raw softmax by design.** Label smoothing (ε=0.1, K=38) bounds the
 achievable softmax output at `(1−ε) + ε/K = 0.9026`, and live predictions sit exactly there
 (median 0.9025). That is the loss function working as intended, not model uncertainty — but it
-means `confidence` should not be read as a calibrated probability until temperature scaling is
-fitted. See [`brain.md`](brain.md) §7.1.
+means the raw number should not be read as a probability. Set `CROPGUARD_TEMPERATURE=0.5908`
+to serve calibrated confidence; responses carry a `calibrated` flag either way. See
+[`brain.md`](brain.md) §7.1.
 
 ### Configuration
 
@@ -166,7 +168,9 @@ All settings are env vars with the `CROPGUARD_` prefix:
 | `CROPGUARD_MODEL_PATH` | `models/cropguard.onnx` | ONNX weights |
 | `CROPGUARD_CLASSES_PATH` | `configs/classes.json` | label order |
 | `CROPGUARD_MODEL_VERSION` | `v0.1.0-baseline` | reported in responses + metrics |
-| `CROPGUARD_CORS_ORIGINS` | `http://localhost:5173` | comma-separated |
+| `CROPGUARD_CORS_ORIGINS` | `localhost:5173,localhost:8501` | comma-separated allowlist, not `*` |
+| `CROPGUARD_TEMPERATURE` | `1.0` | calibration; `0.5908` for this model |
+| `CROPGUARD_MAX_BATCH_SIZE` | `8` | images per `/predict/batch` |
 | `CROPGUARD_DATA_DIR` | `data` | dataset root (overrides config) |
 | `CROPGUARD_HF_REPO` | unset | HF Hub repo to pull weights from at startup |
 
@@ -270,7 +274,7 @@ gap. ECE is population-weighted; MCE is a max over bins including tiny ones. See
 ## Error analysis
 
 Per-class metrics carry **Wilson score intervals**, because per-class recall is a binomial
-proportion and eight classes have fewer than 100 test images:
+proportion and ten classes have fewer than 100 test images:
 
 ```
 Potato___healthy      n=24   R=0.833 [0.641, 0.933]   <- four mistakes; do not read as 0.833
@@ -370,7 +374,7 @@ guard against training/serving skew.
 - [x] Calibration: temperature scaling, ECE/MCE/Brier, reliability curves
 - [x] Error analysis: Wilson intervals, confusion pairs, confident mistakes
 - [x] Streamlit demo UI
-- [ ] Apply the fitted temperature in the serving path
+- [x] Apply the fitted temperature in the serving path
 - [ ] MC-dropout / ensemble uncertainty
 - [ ] Error and subgroup analysis (lab vs. field photos)
 - [ ] `/feedback` endpoint and drift detection (PSI, KS test) with retraining triggers

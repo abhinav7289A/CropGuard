@@ -3,7 +3,7 @@
 A single accuracy figure hides everything actionable. This module answers three questions:
 
 1. **Which classes are weak, and is that signal or noise?** Per-class recall is a binomial
-   proportion, and eight of our classes have fewer than 100 test images. `Potato___healthy`
+   proportion, and ten of our classes have fewer than 100 test images. `Potato___healthy`
    shows recall 0.833 — which is four mistakes out of 24. Every per-class figure here carries
    a Wilson interval so a small-sample class cannot be mistaken for a real weakness.
 
@@ -29,7 +29,7 @@ def wilson_interval(successes: int, trials: int, z: float = Z_95) -> tuple[float
 
     Not the normal approximation `p ± z·sqrt(p(1-p)/n)`: that degenerates badly at small n or
     extreme p — at p=1.0 it returns a zero-width interval, claiming certainty from a handful
-    of samples. Wilson stays inside [0, 1] and keeps sensible width. With eight classes under
+    of samples. Wilson stays inside [0, 1] and keeps sensible width. With ten classes under
     100 test images, this is the difference between an honest table and a misleading one.
     """
     if trials == 0:

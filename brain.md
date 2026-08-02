@@ -128,7 +128,7 @@ does your model get wrong" than a single accuracy figure.
 
 **One caveat to state before anyone else spots it.** `Potato___healthy` shows recall 0.833 —
 but its support is **24 images**, so that is four mistakes, and the 95% CI spans roughly ±15
-points. Eight classes have fewer than 100 test images. The `min_samples_per_class: 100`
+points. Ten classes have fewer than 100 test images. The `min_samples_per_class: 100`
 validation gate checks the *total*, and 15% of 100 is 15 test images; for per-class test
 metrics with usable error bars the gate should be on split size, not total (§2).
 
@@ -169,15 +169,29 @@ Three gates, run before anything trains, exiting non-zero so CI fails on bad dat
 |---|---|---|
 | Integrity | `PIL.verify()` decodes | A truncated JPEG throws mid-epoch, killing a multi-hour run |
 | Resolution | ≥128px short side | Upsampling to 224 fabricates detail that isn't there |
-| Class balance | ≥100 samples/class | Below this, per-class metrics have uselessly wide error bars |
+| Class balance | ≥100 samples/class (total) | Hard gate — fails the pipeline |
+| Test-split share | ≥100 samples/class **in test** | Warns — see below |
 
 That last threshold is a **statistical** argument, not a stylistic one. Per-class recall is a
 binomial proportion; its standard error is `√(p(1-p)/n)`. At n=100 and p≈0.9 that is ~3%, so a
 95% CI spans roughly ±6pp. Below n=100 the interval widens past the point where per-class
 numbers mean anything.
 
+**The original gate measured the wrong quantity.** `min_samples_per_class` counts the whole
+dataset, but per-class recall is measured on the *test* split, and its standard error is
+`√(p(1−p)/n_test)`. At a 15% test fraction, 100 images total leaves 15 in test — an interval
+tens of points wide.
+
+`Potato___healthy` is the worked example: 152 images, clears the 100 gate comfortably, and
+ends up with **24 in test**. Recall 0.833, 95% CI [0.641, 0.933]. **Ten of 38 classes** are in
+that position.
+
+The gate now derives the test share and warns. **Warns, not fails** — refusing to train on an
+otherwise valid public dataset would be the wrong call. The useful output is knowing *which*
+per-class numbers cannot carry weight, which is why §8.9 reports Wilson intervals beside them.
+
 Result on our data: 54,305 images, 0 corrupt, 0 low-resolution, 0 underpopulated (smallest
-class = 152).
+class = 152), 10 classes flagged as thin in test.
 
 ---
 
@@ -682,6 +696,21 @@ scaling have enough freedom to overfit a calibration set far smaller than the tr
 change. Accuracy is *provably* identical before and after — which is what makes it safe to
 apply to a model already in production. The CLI asserts it rather than trusting it.
 
+### Applying it in production
+
+Evaluation-only calibration is a report, not a fix. `CROPGUARD_TEMPERATURE` now feeds the
+serving path, and the response carries a `calibrated` flag so a consumer can tell whether
+`confidence` has been adjusted — a probability whose provenance is unstated is worse than one
+that is plainly raw.
+
+Two guards matter here:
+
+- **T ≤ 0 is rejected at construction.** Zero divides; negative reverses the ordering and
+  would serve the *least* likely class as the answer.
+- **A test asserts the predicted class and top-k ordering are byte-identical** across
+  temperatures. That is the monotonicity property, and it is the reason this can be switched
+  on for a model already serving traffic without re-validating accuracy.
+
 ### The result
 
 | | ECE | MCE | Brier | mean conf | accuracy |
@@ -714,7 +743,7 @@ This is not pedantry here. `Potato___healthy`:
   recall 0.833, n = 24  →  95% CI **[0.641, 0.933]**
 
 Four mistakes. The true recall could plausibly be 64% or 93%. Quoting "0.833" as a weakness
-without that interval is overclaiming, and eight classes fall below 100 test images.
+without that interval is overclaiming, and ten classes fall below 100 test images.
 
 ### The confusion structure
 
@@ -1098,7 +1127,7 @@ After that: `uncertainty` is predictive entropy rather than genuine epistemic un
 it cannot flag an input unlike anything in training; the temperature-scaled probabilities are
 computed in evaluation but **not yet applied in the serving path**, so the API still returns
 raw under-confident softmax; there is no multiple-comparisons correction once sweeps begin;
-and eight classes have fewer than 100 test images, so their per-class metrics carry intervals
+and ten classes have fewer than 100 test images, so their per-class metrics carry intervals
 too wide to act on.
 
 **"Your API takes 3.5 seconds per prediction. Is that acceptable?"**

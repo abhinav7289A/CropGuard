@@ -59,9 +59,16 @@ services:
       - key: CROPGUARD_CLASSES_PATH
         value: /app/configs/classes.json
 
-      # Comma-separated. Tighten this to your own frontend origin before sharing the URL.
+      # Comma-separated allowlist, not "*". CORS is the only thing stopping an arbitrary
+      # page from calling this API with a visitor's browser. Add your frontend origin here.
       - key: CROPGUARD_CORS_ORIGINS
-        value: "*"
+        value: "http://localhost:5173,http://localhost:8501"
+
+      # Fitted on the validation split by cropguard.evaluation.calibrate. Without it the API
+      # reports raw softmax, which is under-confident: label smoothing caps output at ~0.90
+      # while the model is 99.11% accurate. Monotonic, so predictions are unchanged.
+      - key: CROPGUARD_TEMPERATURE
+        value: "0.5908"
 
       - key: CROPGUARD_MAX_UPLOAD_MB
         value: "10"

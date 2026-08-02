@@ -33,9 +33,17 @@ class Settings(BaseSettings):
     model_path: Path = Path("models/cropguard.onnx")
     classes_path: Path = Path("configs/classes.json")
     model_version: str = "v0.1.0-baseline"
-    cors_origins: str = "http://localhost:5173"  # comma-separated
+    # Comma-separated allowlist. "*" is deliberately not the default: CORS is the only thing
+    # stopping an arbitrary page from calling this API with a visitor's browser.
+    cors_origins: str = "http://localhost:5173,http://localhost:8501"
     max_upload_mb: int = 10
     min_resolution: int = 128
+    max_batch_size: int = 8
+
+    # Temperature from cropguard.evaluation.calibrate, fitted on validation. 1.0 = raw softmax.
+    # This model is under-confident without it: label smoothing caps output at ~0.90 while the
+    # model is 99.11% accurate, so the honest fitted value is 0.591.
+    temperature: float = 1.0
 
 
 settings = Settings()
@@ -68,7 +76,10 @@ def get_model() -> CropGuardModel:
     if _model is None:
         try:
             _model = CropGuardModel(
-                settings.model_path, settings.classes_path, settings.model_version
+                settings.model_path,
+                settings.classes_path,
+                settings.model_version,
+                temperature=settings.temperature,
             )
         except Exception as exc:  # model not trained/downloaded yet
             _model_error = str(exc)
@@ -114,6 +125,51 @@ async def predict(file: UploadFile = File(...)) -> dict:
     return result
 
 
+@app.post("/predict/batch")
+async def predict_batch(files: list[UploadFile] = File(...)) -> dict:
+    """Several images in one request.
+
+    Capped at `max_batch_size`: each image is a full forward pass, and on the free tier's
+    0.1 vCPU a large batch would hold the single worker long enough to look like an outage.
+    Validation failures are reported per image rather than failing the whole request, so one
+    bad upload does not discard the rest.
+    """
+    start = time.time()
+    if len(files) > settings.max_batch_size:
+        REQUESTS.labels("/predict/batch", "413", settings.model_version).inc()
+        raise HTTPException(
+            413, f"Batch of {len(files)} exceeds limit of {settings.max_batch_size}"
+        )
+
+    model = get_model()  # 503s the whole request if no model - nothing to partially succeed at
+    results: list[dict] = []
+    for upload in files:
+        data = await upload.read()
+        try:
+            _validate_image(data)
+            result = model.predict(data)
+        except HTTPException as exc:
+            results.append(
+                {"filename": upload.filename, "error": exc.detail, "status": exc.status_code}
+            )
+            continue
+        result["filename"] = upload.filename
+        results.append(result)
+        CONFIDENCE.labels(result["predicted_class"]).observe(result["confidence"])
+
+    duration = time.time() - start
+    LATENCY.labels("/predict/batch").observe(duration)
+    REQUESTS.labels("/predict/batch", "200", settings.model_version).inc()
+    succeeded = sum(1 for r in results if "error" not in r)
+    return {
+        "results": results,
+        "count": len(results),
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded,
+        "latency_ms": round(duration * 1000, 1),
+    }
+
+
 @app.get("/health")
 def health() -> dict:
     model_loaded = _model is not None
@@ -127,6 +183,8 @@ def health() -> dict:
         "status": "healthy" if model_loaded else "degraded",
         "model_loaded": model_loaded,
         "model_version": settings.model_version,
+        "calibrated": settings.temperature != 1.0,
+        "temperature": settings.temperature,
         "model_error": _model_error,
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "api_version": __version__,

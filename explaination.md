@@ -373,6 +373,48 @@ misattributes a cause is worse than no log at all.
 
 ## 5. Change log
 
+### 2026-08-02 (quick wins) — Calibration reaches production, and a miscount corrected
+
+**1. Temperature applied in the serving path.** `CROPGUARD_TEMPERATURE` now feeds
+`CropGuardModel`, and responses carry a `calibrated` flag so a consumer can tell whether
+`confidence` has been adjusted — an unlabelled probability is worse than a plainly raw one.
+
+Two guards: `T <= 0` is rejected at construction (zero divides; negative reverses the ordering
+and would serve the *least* likely class), and a test asserts the predicted class and top-k
+ordering are identical across temperatures. That monotonicity property is precisely what lets
+this be switched on for a model already serving traffic without re-validating accuracy.
+
+Not yet enabled on Render — set `CROPGUARD_TEMPERATURE=0.5908` in `render.yaml` to turn it on.
+
+**2. The validation gate measured the wrong quantity.** `min_samples_per_class` counted the
+whole dataset, but per-class recall is measured on the *test* split, where the standard error
+is `sqrt(p(1-p)/n_test)`. At a 15% test fraction, 100 images total leaves 15 in test.
+
+`Potato___healthy`: 152 images, clears the gate, ends up with 24 in test. The gate now derives
+the test share and **warns rather than fails** — refusing to train on a valid public dataset
+would be the wrong call; knowing which per-class numbers cannot carry weight is the useful
+output.
+
+**3. `POST /predict/batch`.** Capped at 8 images, because each is a full forward pass and on
+0.1 vCPU a large batch would hold the single worker long enough to look like an outage.
+Per-image errors rather than all-or-nothing: failing an entire batch because one upload is
+malformed makes the endpoint useless for its actual purpose, which is processing a folder of
+field photos where a few are always broken. Results keep input order and carry filenames, so a
+caller can zip them back.
+
+**4. CORS no longer defaults to `*`.** Now `localhost:5173,localhost:8501` (Vite, Streamlit).
+CORS is the only thing stopping an arbitrary page from calling the API with a visitor's
+browser. Note it is a *browser* control — the Streamlit app calls server-side and is
+unaffected either way.
+
+**A correction.** Earlier entries said **eight** classes have fewer than 100 test images. It is
+**ten**: Apple scab (95), Apple Black rot (90), Cedar apple rust (40), Corn Cercospora (77),
+Grape healthy (63), Peach healthy (55), Potato healthy (24), Raspberry healthy (55),
+Strawberry healthy (68), Tomato mosaic virus (56). I had miscounted from the classification
+report. Fixed in brain.md, README.md and the module docstrings.
+
+Tests: 127 -> 143.
+
 ### 2026-08-02 (later) — Calibration, error analysis, and a demo UI
 
 **Calibration: the model was under-confident, by exactly the predicted amount.**
@@ -399,7 +441,7 @@ rather than only the flattering one.
 figure carries a **Wilson** interval - not the normal approximation, which returns a zero-width
 interval at p=1.0 and so claims certainty from a handful of samples. `Potato___healthy`:
 recall 0.833 on n=24 -> CI [0.641, 0.933]. Four mistakes. Quoting 0.833 as a weakness without
-that interval would be overclaiming, and eight classes fall under 100 test images.
+that interval would be overclaiming, and ten classes fall under 100 test images.
 
 The confusion structure is more informative than any single number:
 
@@ -428,8 +470,8 @@ shift-invariant) but storing them removes the need for that argument.
 
 Tests: 101 -> 127.
 
-**Known gap:** the fitted temperature is used in evaluation but **not applied in the serving
-path**. The deployed API still returns raw, under-confident softmax.
+**Known gap (closed the same day — see the entry above):** the fitted temperature was used
+in evaluation but not applied in the serving path.
 
 ### 2026-08-02 — Deployed, and production latency is 146x the laptop benchmark
 
