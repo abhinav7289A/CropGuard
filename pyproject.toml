@@ -54,6 +54,12 @@ eval = [
     "scipy>=1.11",
     "scikit-learn>=1.4",
 ]
+# Streamlit demo UI. Talks to the deployed API by default, so it does not need torch,
+# onnxruntime, or the dataset — it is installable on its own.
+demo = [
+    "streamlit>=1.35",
+    "pillow>=10.0",
+]
 dev = [
     "pytest>=8.0",
     "httpx>=0.27",

@@ -151,7 +151,7 @@ deployable before the first model exists.
 `uncertainty` is currently normalized predictive entropy in [0, 1]; MC-dropout and ensemble
 variance land with the calibration work.
 
-**Confidence is capped at ~0.90 by design.** Label smoothing (ε=0.1, K=38) bounds the
+**Confidence is capped at ~0.90 by design, and the API returns it uncalibrated.** Label smoothing (ε=0.1, K=38) bounds the
 achievable softmax output at `(1−ε) + ε/K = 0.9026`, and live predictions sit exactly there
 (median 0.9025). That is the loss function working as intended, not model uncertainty — but it
 means `confidence` should not be read as a calibrated probability until temperature scaling is
@@ -240,6 +240,68 @@ override `train.lr` without losing the rest of the `train` block.
 
 Set `WANDB_MODE=offline` (or leave `WANDB_API_KEY` unset) to train without Weights & Biases.
 
+## Calibration
+
+A 99% accurate model can still be badly calibrated, and this one was — in the *under*-confident
+direction, which is the less common one:
+
+| | ECE | MCE | Brier | mean confidence | accuracy |
+|---|---|---|---|---|---|
+| Raw softmax | 0.0895 | 0.2777 | 0.0217 | 0.9020 | 0.9911 |
+| **Temperature-scaled (T = 0.591)** | **0.0036** | 0.3377 | **0.0138** | 0.9946 | 0.9911 |
+
+```bash
+python -m cropguard.evaluation.calibrate     --val artifacts/preds_val.npz --test artifacts/preds_fp32.npz     --out artifacts/calibration.json
+```
+
+**ECE fell 96%**, and accuracy is provably unchanged — dividing logits by a positive scalar is
+monotonic, so no prediction can move. T is fitted on **validation only**; fitting on test would
+tune the calibration to the set used to report it.
+
+`T = 0.591 < 1` means *sharpening*: the model was under-confident. That is exactly what label
+smoothing predicts (ε=0.1, K=38 ⇒ ceiling 0.9026), and mean confidence before calibration was
+0.9020. Theory and measurement agree.
+
+**MCE rose**, which is expected rather than a defect: calibration concentrated 8,042 of 8,125
+predictions into one high-confidence bin, leaving sparse bins where a few errors make a large
+gap. ECE is population-weighted; MCE is a max over bins including tiny ones. See
+[`brain.md`](brain.md) §8.8.
+
+## Error analysis
+
+Per-class metrics carry **Wilson score intervals**, because per-class recall is a binomial
+proportion and eight classes have fewer than 100 test images:
+
+```
+Potato___healthy      n=24   R=0.833 [0.641, 0.933]   <- four mistakes; do not read as 0.833
+Corn___Cercospora     n=77   R=0.922 [0.840, 0.964]
+Tomato___Early_blight n=149  R=0.913 [0.856, 0.948]
+```
+
+The confusion structure says more than any single number:
+
+| True → Predicted | Count | |
+|---|---|---|
+| Tomato Early blight → Late blight | 8 | bidirectional |
+| Corn Cercospora ↔ Northern Leaf Blight | 6 + 3 | bidirectional |
+| Tomato Spider mites → Target Spot | 6 | |
+| Potato Late blight → Tomato Late blight | 3 | *same pathogen, different host* |
+
+The four most-confident mistakes all fall in these pairs rather than scattering — which is the
+reassuring shape, since scattered confident errors would suggest something spurious had been
+learned.
+
+## Demo UI
+
+```bash
+pip install -e ".[demo]"
+streamlit run app/streamlit_app.py
+```
+
+Upload a leaf and get the prediction, top-3, confidence, uncertainty, and both latencies —
+against the live API or a local ONNX model. It shows the confidence ceiling explicitly rather
+than presenting ~0.90 as a calibrated probability.
+
 ## Statistical model comparison
 
 Accuracy going up is not evidence that a model is better. `cropguard.evaluation` runs the
@@ -305,7 +367,11 @@ guard against training/serving skew.
 - [x] Publish weights to HF Hub ([`XiElonMAsk/cropguard-models`](https://huggingface.co/XiElonMAsk/cropguard-models))
 - [x] Deploy to Render — live, with real latency measured
 - [ ] ConvNeXt-Tiny challenger and the first real A/B comparison
-- [ ] Calibration: temperature scaling, ECE, reliability diagrams, MC-dropout uncertainty
+- [x] Calibration: temperature scaling, ECE/MCE/Brier, reliability curves
+- [x] Error analysis: Wilson intervals, confusion pairs, confident mistakes
+- [x] Streamlit demo UI
+- [ ] Apply the fitted temperature in the serving path
+- [ ] MC-dropout / ensemble uncertainty
 - [ ] Error and subgroup analysis (lab vs. field photos)
 - [ ] `/feedback` endpoint and drift detection (PSI, KS test) with retraining triggers
 - [ ] Render deployment, load testing, Grafana dashboard

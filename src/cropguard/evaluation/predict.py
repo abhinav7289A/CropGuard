@@ -46,6 +46,9 @@ def predict_split(
     image_root = root / "plantvillage"
 
     labels = np.array([class_to_idx[p.split("/")[0]] for p in paths], dtype=np.int64)
+    # Logits are kept as well as probabilities: temperature scaling operates on logits, and
+    # recovering them afterwards costs a log() plus an argument about shift-invariance.
+    raw_logits = np.zeros((len(paths), len(class_names)), dtype=np.float32)
     probabilities = np.zeros((len(paths), len(class_names)), dtype=np.float32)
 
     for start in range(0, len(paths), batch_size):
@@ -54,6 +57,7 @@ def predict_split(
             [preprocess((image_root / p).read_bytes(), image_size) for p in chunk], axis=0
         )
         logits = session.run(["logits"], {"input": batch})[0]
+        raw_logits[start : start + len(chunk)] = logits
         probabilities[start : start + len(chunk)] = softmax(logits)
         if start % (batch_size * 20) == 0:
             print(f"  {min(start + len(chunk), len(paths))}/{len(paths)}", flush=True)
@@ -63,6 +67,7 @@ def predict_split(
         "paths": np.array(paths),
         "labels": labels,
         "predictions": predictions,
+        "logits": raw_logits,
         "probabilities": probabilities,
         "correct": (predictions == labels),
     }

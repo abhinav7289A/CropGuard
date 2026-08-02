@@ -50,3 +50,6 @@ Thumbs.db
 
 # Personal planning doc — kept locally, never published
 workflow.md
+
+# Evaluation outputs (regenerate with cropguard.evaluation.predict)
+/artifacts/

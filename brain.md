@@ -8,9 +8,8 @@ breaks*.
 
 **Scope note:** only built components are covered. **DVC is deliberately absent** — it is not
 in this project yet, so there is nothing here to defend. Likewise no MLflow, hyperparameter
-sweeps, calibration, drift detection, or the ConvNeXt challenger. Claiming those in an
-interview when the repo does not contain them is exactly the trap this document exists to
-avoid.
+sweeps, drift detection, or the ConvNeXt challenger. Claiming those in an interview when the
+repo does not contain them is exactly the trap this document exists to avoid.
 
 **Results are real and the API is live** (§0, §11). Everything beyond the trained baseline and
 its deployment is still unbuilt, so do not describe it as done.
@@ -50,6 +49,19 @@ is the one taken on the deployment target. See §11.
 
 **Do not quote sub-second latency for this deployment.** The honest number is ~3.5 s/image on
 the free tier.
+
+A **Streamlit demo** (`app/streamlit_app.py`) runs against either the live API or a local ONNX
+model, and reports the prediction, top-3, confidence, uncertainty and both latencies.
+
+### Calibration
+
+| | ECE | Brier | mean confidence |
+|---|---|---|---|
+| Raw softmax | 0.0895 | 0.0217 | 0.9020 |
+| **Temperature-scaled (T = 0.591)** | **0.0036** | **0.0138** | 0.9946 |
+
+**96% ECE reduction, accuracy provably unchanged.** T < 1 means the model needed *sharpening* —
+it was under-confident, exactly as label smoothing predicts (§7.1, §8.8).
 
 ### The leakage result — and a hypothesis that did not survive
 
@@ -633,6 +645,100 @@ real concern. The honest answer is: correction is needed once we start selecting
 
 ---
 
+## 8.8 Calibration — the model was under-confident, and by exactly the predicted amount
+
+Accuracy says nothing about whether a "90% confident" prediction is right 90% of the time.
+This model is 99.11% accurate and was **badly calibrated**, in the direction theory predicts.
+
+### The metrics
+
+**Expected Calibration Error.** Bin predictions by confidence, compare each bin's accuracy to
+its mean confidence:
+
+  `ECE = Σ_b (n_b/n) · |acc(b) − conf(b)|`
+
+Weighted by bin population, so a bin holding three predictions cannot dominate.
+
+**Maximum Calibration Error** is the worst single bin — the tail risk ECE averages away.
+
+**Brier score** is the mean squared error against the one-hot target. Unlike ECE it is a
+**proper scoring rule**, which matters: a model that reports a constant confidence equal to its
+overall accuracy scores a *perfect* ECE while being useless. Brier penalises it. Report both.
+
+### Temperature scaling
+
+Divide logits by one learned scalar before the softmax:
+
+  `p = softmax(z / T)`
+
+- `T > 1` softens (fixes over-confidence)
+- `T < 1` sharpens (fixes under-confidence)
+
+Fitted by minimising NLL on **validation** — fitting on test would tune the calibration to the
+set used to report it. One parameter only: with 38 classes, per-class temperatures or vector
+scaling have enough freedom to overfit a calibration set far smaller than the training set.
+
+**The safety property:** dividing by a positive scalar is monotonic, so the argmax cannot
+change. Accuracy is *provably* identical before and after — which is what makes it safe to
+apply to a model already in production. The CLI asserts it rather than trusting it.
+
+### The result
+
+| | ECE | MCE | Brier | mean conf | accuracy |
+|---|---|---|---|---|---|
+| Before | 0.0895 | 0.2777 | 0.0217 | 0.9020 | 0.9911 |
+| **After (T = 0.591)** | **0.0036** | 0.3377 | **0.0138** | 0.9946 | 0.9911 |
+
+**ECE fell 96%.** And note **T = 0.591 < 1** — the model needed *sharpening*, i.e. it was
+under-confident. That is exactly what §7.1 predicts: label smoothing caps confidence at
+0.9026, and mean confidence before calibration was 0.9020 against 99.11% accuracy. The
+theory, the observed ceiling, and the fitted temperature all agree.
+
+**Be ready for the follow-up: MCE went *up*.** That is real and worth explaining. Calibration
+pushed 8,042 of 8,125 predictions into a single high-confidence bin, leaving sparse bins
+(n=27, n=18) where a handful of errors makes a large gap. ECE is population-weighted so it
+improves; MCE takes the max over bins including tiny ones, so it degrades. Neither number is
+wrong — they measure different things, which is why both are reported.
+
+---
+
+## 8.9 Error analysis — where the mistakes actually are
+
+**Per-class recall is a binomial proportion**, so every per-class figure carries a **Wilson
+score interval**. Not the normal approximation `p ± z·√(p(1−p)/n)`, which degenerates badly:
+at p = 1.0 it returns a *zero-width* interval, claiming certainty from ten samples. Wilson
+stays inside [0, 1] and keeps sensible width.
+
+This is not pedantry here. `Potato___healthy`:
+
+  recall 0.833, n = 24  →  95% CI **[0.641, 0.933]**
+
+Four mistakes. The true recall could plausibly be 64% or 93%. Quoting "0.833" as a weakness
+without that interval is overclaiming, and eight classes fall below 100 test images.
+
+### The confusion structure
+
+| True → Predicted | Count | Note |
+|---|---|---|
+| Tomato Early blight → Late blight | 8 | bidirectional pair |
+| Corn Cercospora ↔ Northern Leaf Blight | 6 + 3 | bidirectional |
+| Tomato Spider mites → Target Spot | 6 | |
+| **Potato Late blight → Tomato Late blight** | 3 | **same pathogen, different host** |
+
+That last row is the interesting one: *Phytophthora infestans* causes late blight in both
+potato and tomato, with near-identical lesions. The model is confusing two genuinely similar
+things, not making a random error.
+
+The four **most confident** mistakes all come from these same pairs. That is the reassuring
+shape: a model whose confident errors cluster on biologically hard distinctions is behaving
+sensibly, unlike one whose confident errors are scattered — which would suggest it had learned
+something spurious.
+
+**Why rank confusion pairs by count rather than rate:** a 50% error rate on a 4-image class is
+noise; 8 misroutes out of 149 is a pattern. Both are reported so either reading is available.
+
+---
+
 ## 9. Export and quantisation
 
 ### 9.1 Why ONNX
@@ -988,10 +1094,12 @@ phone picture taken in a field, and the literature on this dataset reports large
 Until that gap is measured, the accuracy figure describes a benchmark, not the problem the
 project claims to address.
 
-After that: `uncertainty` is predictive entropy rather than genuine epistemic uncertainty;
-confidence is uncalibrated and label smoothing makes it systematically under-confident; there
-is no multiple-comparisons correction once sweeps begin; and eight classes have fewer than 100
-test images, so their per-class metrics are too noisy to act on.
+After that: `uncertainty` is predictive entropy rather than genuine epistemic uncertainty —
+it cannot flag an input unlike anything in training; the temperature-scaled probabilities are
+computed in evaluation but **not yet applied in the serving path**, so the API still returns
+raw under-confident softmax; there is no multiple-comparisons correction once sweeps begin;
+and eight classes have fewer than 100 test images, so their per-class metrics carry intervals
+too wide to act on.
 
 **"Your API takes 3.5 seconds per prediction. Is that acceptable?"**
 Not for an interactive product, and I would not claim otherwise. It is Render's free tier at
@@ -1013,6 +1121,28 @@ Label smoothing at 0.1 over 38 classes caps the achievable softmax output at
 function doing what it is designed to do, not the model being unsure. It also means the
 confidence value should not be shown to a user as a probability until it is recalibrated -
 temperature scaling on the validation set is the fix, and it is not built yet.
+
+**"Is your model well calibrated?"**
+It was not — ECE 0.0895, and *under*-confident rather than over, which is the less common
+direction. Label smoothing caps achievable confidence at (1-eps) + eps/K = 0.9026, and the
+model sat at 0.9020 mean confidence while being 99.11% accurate. Temperature scaling fitted on
+validation gave T = 0.591 (T < 1 sharpens) and cut ECE to 0.0036. Accuracy is unchanged by
+construction, since dividing logits by a positive scalar cannot reorder them.
+
+**"Your MCE got worse after calibration. Explain that."**
+It did, 0.278 to 0.338, and it is not a mistake. MCE is the worst single bin. Calibration moved
+8,042 of 8,125 predictions into one high-confidence bin, leaving sparse bins of 20-30
+predictions where two or three errors produce a large gap. ECE is weighted by bin population
+so it improves; MCE is a max over bins including the tiny ones. They measure different things
+and I report both rather than the flattering one.
+
+**"Which classes is your model worst at?"**
+By F1: Potato healthy, corn Cercospora, tomato Early blight. But the first has 24 test images,
+so its 0.833 recall is four mistakes with a Wilson interval of [0.641, 0.933] - I would not
+call that a weakness on that evidence. The defensible answer is the *confusion structure*:
+tomato Early/Late blight and corn Cercospora/Northern Leaf Blight, both bidirectional, plus
+potato-to-tomato Late blight, which is literally the same pathogen on a different host. The
+confident errors cluster on those pairs rather than scattering, which is what you want to see.
 
 **"You're at 99.11%. What would you do next?"**
 Nothing aimed at the accuracy number — the headroom is 0.9% and the remaining errors are

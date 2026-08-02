@@ -18,7 +18,7 @@ marked superseded, so the reasoning trail stays intact.
 | **Critical path** | Week 1 Day 6–7 complete — **baseline trained** |
 | **Baseline** | ResNet50, **99.11% test accuracy / 0.9865 macro-F1** on the leak-free holdout |
 | **Built ahead of schedule** | Week 3 A/B testing, most of Week 4 serving |
-| **Tests** | 101 passing, ruff clean |
+| **Tests** | 127 passing, ruff clean |
 | **Dataset** | 54,305 images / 38 classes at `C:\cropguard-data` (outside OneDrive) |
 | **Repo** | github.com/abhinav7289A/CropGuard |
 | **Live API** | https://cropguard-api-w9ch.onrender.com |
@@ -27,6 +27,8 @@ marked superseded, so the reasoning trail stays intact.
 **Not yet built:** EDA notebook, duplicate detection, DVC, MLflow registry, hyperparameter
 sweeps, augmentation/transfer-learning ablations, calibration, bias analysis, `/feedback`
 endpoint, drift detection, Grafana, load testing, ConvNeXt challenger.
+
+**Calibration and error analysis are now built** — see the 2026-08-02 change-log entry.
 
 ### The headline finding so far
 
@@ -92,6 +94,9 @@ that accuracy would fall, and it did not.
 | `hypothesis.py` | McNemar, bootstrap CI, paired t-test, Cohen's d, power analysis. See §3.9. |
 | `predict.py` | Runs a model over a split, saves per-image predictions to `.npz`. |
 | `compare.py` | A/B comparison CLI. Exits non-zero unless the challenger genuinely wins. |
+| `calibration.py` | ECE, MCE, Brier, reliability curves, temperature scaling. |
+| `calibrate.py` | CLI: fit T on validation, report calibration on test. |
+| `errors.py` | Per-class metrics with Wilson intervals, confusion pairs, confident mistakes. |
 
 ### Infrastructure
 
@@ -105,6 +110,7 @@ that accuracy would fall, and it did not.
 | `notebooks/01_train_baseline.ipynb` | End-to-end baseline training. Detects Lightning AI vs Colab and sets paths accordingly. |
 | `notebooks/upload_to_hf.py` | Publishes the ONNX graphs and a generated model card to HF Hub. |
 | `render.yaml` | Render Blueprint for the deployed API. |
+| `app/streamlit_app.py` | Demo UI — upload a leaf, see prediction, confidence, latency. |
 
 ### Tests worth knowing about
 
@@ -366,6 +372,64 @@ misattributes a cause is worse than no log at all.
 ---
 
 ## 5. Change log
+
+### 2026-08-02 (later) — Calibration, error analysis, and a demo UI
+
+**Calibration: the model was under-confident, by exactly the predicted amount.**
+
+| | ECE | MCE | Brier | mean conf | accuracy |
+|---|---|---|---|---|---|
+| Raw softmax | 0.0895 | 0.2777 | 0.0217 | 0.9020 | 0.9911 |
+| Temperature-scaled | **0.0036** | 0.3377 | **0.0138** | 0.9946 | 0.9911 |
+
+T = 0.5908, fitted on 2,377 validation images, applied to the 8,125-image test set. **T < 1
+means sharpening** - the model was under-confident, which is the less common direction and
+precisely what label smoothing predicts. Mean confidence 0.9020 against a theoretical ceiling
+of 0.9026 and 99.11% accuracy: theory, observed ceiling and fitted temperature all agree.
+
+Accuracy is identical before and after, and the CLI asserts that rather than trusting it -
+dividing logits by a positive scalar is monotonic, so the argmax cannot move.
+
+**MCE rose, and that is not a bug.** Calibration concentrated 8,042 of 8,125 predictions into
+one high-confidence bin, leaving sparse bins (n=27, n=18) where a few errors make a large gap.
+ECE is population-weighted; MCE is a max over bins including the tiny ones. Both are reported
+rather than only the flattering one.
+
+**Error analysis with honest intervals.** Per-class recall is a binomial proportion, so every
+figure carries a **Wilson** interval - not the normal approximation, which returns a zero-width
+interval at p=1.0 and so claims certainty from a handful of samples. `Potato___healthy`:
+recall 0.833 on n=24 -> CI [0.641, 0.933]. Four mistakes. Quoting 0.833 as a weakness without
+that interval would be overclaiming, and eight classes fall under 100 test images.
+
+The confusion structure is more informative than any single number:
+
+| True -> Predicted | Count | |
+|---|---|---|
+| Tomato Early blight -> Late blight | 8 | bidirectional |
+| Corn Cercospora <-> Northern Leaf Blight | 6 + 3 | bidirectional |
+| Tomato Spider mites -> Target Spot | 6 | |
+| Potato Late blight -> Tomato Late blight | 3 | same pathogen, different host |
+
+The last is *Phytophthora infestans*, which genuinely causes late blight in both crops with
+near-identical lesions. The four most-confident mistakes all fall in these pairs rather than
+scattering - the shape you want, since scattered confident errors would suggest the model had
+latched onto something spurious.
+
+**Streamlit demo** (`app/streamlit_app.py`): upload a leaf, get prediction, top-3, confidence,
+uncertainty and both latencies, against either the live API or a local ONNX model. The chart
+uses the *emphasis* form - rank 1 in the accent hue, ranks 2-3 recessive - because the winner
+is the subject, not the class identities; every bar is directly labelled so nothing depends on
+colour alone. It surfaces the confidence ceiling explicitly rather than presenting ~0.90 as if
+it were a calibrated probability.
+
+**`predict.py` now stores logits** alongside probabilities. Temperature scaling operates on
+logits; recovering them from probabilities works (log(p) = z - logsumexp(z), and softmax is
+shift-invariant) but storing them removes the need for that argument.
+
+Tests: 101 -> 127.
+
+**Known gap:** the fitted temperature is used in evaluation but **not applied in the serving
+path**. The deployed API still returns raw, under-confident softmax.
 
 ### 2026-08-02 — Deployed, and production latency is 146x the laptop benchmark
 
