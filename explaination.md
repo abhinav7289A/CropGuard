@@ -108,6 +108,7 @@ that accuracy would fall, and it did not.
 | `.github/workflows/ci.yml` | Three jobs: lint, test, and a Docker build + container smoke test. |
 | `scripts/fetch_model.py` | Pulls model weights from HF Hub at container start if not baked in. |
 | `notebooks/01_train_baseline.ipynb` | End-to-end baseline training. Detects Lightning AI vs Colab and sets paths accordingly. |
+| `notebooks/02_challenger_ab_test.ipynb` | Trains ConvNeXt-Tiny and runs the paired A/B against the deployed baseline. |
 | `notebooks/upload_to_hf.py` | Publishes the ONNX graphs and a generated model card to HF Hub. |
 | `render.yaml` | Render Blueprint for the deployed API. |
 | `src/cropguard/monitoring/drift.py` | PSI, KS, TVD drift detection over confidence and class mix. |
@@ -373,6 +374,39 @@ misattributes a cause is worse than no log at all.
 ---
 
 ## 5. Change log
+
+### 2026-08-03 (later) — Challenger notebook, and being careful about what it can claim
+
+`notebooks/02_challenger_ab_test.ipynb`: trains ConvNeXt-Tiny, pulls the **deployed** baseline
+from HF Hub rather than retraining it, scores both on the identical holdout, and runs the
+paired comparison.
+
+**The confound, stated up front in the notebook.** The two configs differ in five ways at
+once - architecture, augmentation, epochs, learning rate, weight decay. So the experiment
+answers *"which configuration should ship?"*, which is legitimate and useful. It does **not**
+answer *"is ConvNeXt better than ResNet50"*, because five variables moved together and no
+single one can be credited. Isolating any one needs a controlled ablation, which is Week 2
+work and is not built.
+
+This is worth being explicit about because the overclaim is the natural thing to say and
+exactly what an interviewer probes.
+
+**Why the baseline is pulled from HF Hub rather than retrained:** the comparison should be
+against the artifact actually serving traffic, not a fresh model that happens to share its
+config. Retraining would also introduce run-to-run variance as a sixth confound.
+
+**Pairing requires an identical holdout**, so the notebook asserts the split hash before
+training. McNemar and the bootstrap compare image by image - that is what makes them more
+sensitive than comparing two accuracy numbers, and it is void if the two models saw different
+test sets.
+
+**Expect a null.** The baseline sits at 99.11% on a saturated benchmark with 0.9% of headroom.
+A framework that declines to promote is doing its job, and the notebook says so rather than
+implying a win is the goal.
+
+Verified before shipping: `convnext_tiny.yaml`'s `experiment_name` matches the checkpoint path
+the notebook globs, and `compare.py` runs on real-format prediction files and exits 1 on a
+null - so the CI gate behaves.
 
 ### 2026-08-03 — Drift detection, and a lesson about p-values
 
