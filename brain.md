@@ -1036,7 +1036,93 @@ inefficiency; quantisation is tuning around a model that is oversized for the ta
 
 ---
 
-## 12. CI/CD — what is actually built
+## 12. Drift detection — knowing a model went stale without labels
+
+The defining constraint of production ML monitoring: **you cannot measure accuracy in
+production.** Nobody tells the API what disease the leaf actually had. Test-set metrics
+describe the day the model was built.
+
+What is observable is *distribution*:
+
+| Signal | Detects | Needs labels? |
+|---|---|---|
+| Confidence distribution | inputs drifting off-distribution | no |
+| Predicted-class mix | the population served changed | no |
+| Feedback accuracy | genuine degradation | yes — slow |
+
+### PSI — the confidence signal
+
+  `PSI = Σ_b (current_b − reference_b) · ln(current_b / reference_b)`
+
+Usefully symmetric: it penalises mass appearing where there was none *and* vanishing from
+where there was some. Conventions from credit risk: <0.10 stable, 0.10–0.25 moderate, >0.25
+significant.
+
+Two implementation details that matter:
+
+- **Bin edges come from the reference quantiles**, never the pooled data. Pooled edges let the
+  current distribution redefine the yardstick it is measured against, hiding the shift.
+- **Empty bins are floored at ε.** `ln(0)` is undefined and one empty bin would otherwise
+  produce an infinite PSI that swamps everything else.
+
+### The p-value trap — measured, not asserted
+
+This is the part worth being able to demonstrate. Take the test set, split it into **two random
+halves**, and compare them. Same model, same data, same distribution — by construction there is
+nothing to find:
+
+```
+PSI  0.0028  (stable)        TVD  0.0576  (no shift)
+chi-squared  p = 8.35e-09    <- "wildly significant"
+```
+
+The chi-squared p-value reports p ≈ 1e-8 on **two random halves of identical data**. It is not
+broken; it is answering "could this difference be zero?", and at n=4,000 the answer is
+essentially always no. Statistical significance measures *detectability*, and detectability
+grows with sample size regardless of whether the effect matters.
+
+So the module keys its verdict on **effect sizes**:
+
+- **PSI** for the confidence distribution
+- **Total variation distance** for the class mix: `TVD = ½ Σ|p_i − q_i|`, bounded [0, 1]
+
+Both are invariant to sample count. A monitor whose sensitivity depends on traffic volume will
+page at 3am for nothing, get muted, and then miss the real event — which is strictly worse than
+having no monitor.
+
+The p-values are still reported, labelled `ignore the p`, because someone will ask for them.
+
+### Two signals, not one
+
+An early version keyed the verdict on PSI alone. Testing it against tomato-only traffic exposed
+the gap: **class mix collapsed to one crop while confidence held perfectly steady**, and the
+verdict said "no drift". Both are now separate signals:
+
+| | Means |
+|---|---|
+| Confidence shifted | the model is hedging — inputs may be off-distribution |
+| Class mix shifted | the world moved — new season, new region, one client sending one crop |
+
+They are different events with different responses, and collapsing them into one boolean loses
+the distinction that tells you what to do next.
+
+### The caveat that bit us
+
+**Reference and current windows must be sampled the same way.** Comparing a class-balanced
+validation sample against the naturally-imbalanced test split reported TVD 0.268 and chi-squared
+p = 5.7e-256 — entirely an artefact of *my sampling*, not drift. A reference drawn differently
+from production makes every comparison meaningless, and the failure is silent.
+
+### What this does not do
+
+None of it proves the model got **worse**. Input drift means the world moved, which may or may
+not hurt accuracy. These are triggers to investigate, not verdicts — which is why the thresholds
+open an investigation rather than roll back a deployment. Confirming actual degradation needs
+labels, which means the `/feedback` endpoint, which is not built.
+
+---
+
+## 13. CI/CD — what is actually built
 
 Three jobs on push and PR:
 
@@ -1063,7 +1149,7 @@ nothing wires it into a workflow yet.
 
 ---
 
-## 13. The hard questions
+## 14. The hard questions
 
 **"Everyone gets 99% on PlantVillage. What did you actually add?"**
 A holdout you can trust, and the measurement showing whether it mattered. I found that 74.2%
@@ -1172,6 +1258,15 @@ call that a weakness on that evidence. The defensible answer is the *confusion s
 tomato Early/Late blight and corn Cercospora/Northern Leaf Blight, both bidirectional, plus
 potato-to-tomato Late blight, which is literally the same pathogen on a different host. The
 confident errors cluster on those pairs rather than scattering, which is what you want to see.
+
+**"How would you know if your deployed model degraded?"**
+I cannot measure accuracy in production — nobody labels the leaves. What I monitor is
+distribution: PSI on the confidence distribution, and total variation distance on the predicted
+class mix. Both are effect sizes rather than p-values, deliberately: on two random halves of my
+own test set the chi-squared p-value comes out at 8e-09, so a p-value-triggered monitor would
+fire constantly on nothing. Neither signal proves degradation though — they say the inputs
+moved, and that is a reason to look, not a verdict. Confirming actual decay needs labelled
+feedback, which is not built.
 
 **"You're at 99.11%. What would you do next?"**
 Nothing aimed at the accuracy number — the headroom is 0.9% and the remaining errors are

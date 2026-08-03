@@ -295,6 +295,27 @@ The four most-confident mistakes all fall in these pairs rather than scattering 
 reassuring shape, since scattered confident errors would suggest something spurious had been
 learned.
 
+## Drift detection
+
+You cannot measure accuracy in production — nobody labels the leaves. `cropguard.monitoring`
+watches distributions instead: **PSI** on the confidence distribution (inputs drifting
+off-distribution make the model hedge) and **total variation distance** on the predicted class
+mix (the population served changed).
+
+Both are **effect sizes, not p-values**, and the reason is measurable. Split the test set into
+two random halves — same model, same data, nothing to find:
+
+| | Value | Reads as |
+|---|---|---|
+| PSI | 0.0028 | stable |
+| TVD | 0.0576 | no shift |
+| chi² p-value | **8.35e-09** | "wildly significant" |
+
+The p-value fires on two random halves of identical data, because significance measures
+*detectability* and detectability grows with n. A monitor whose sensitivity depends on traffic
+volume pages for nothing, gets muted, and then misses the real event. See
+[`brain.md`](brain.md) §12.
+
 ## Demo UI
 
 ```bash
@@ -377,5 +398,6 @@ guard against training/serving skew.
 - [x] Apply the fitted temperature in the serving path
 - [ ] MC-dropout / ensemble uncertainty
 - [ ] Error and subgroup analysis (lab vs. field photos)
-- [ ] `/feedback` endpoint and drift detection (PSI, KS test) with retraining triggers
+- [x] Drift detection: PSI on confidence, TVD on class mix
+- [ ] `/feedback` endpoint with retraining triggers
 - [ ] Render deployment, load testing, Grafana dashboard

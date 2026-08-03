@@ -18,7 +18,7 @@ marked superseded, so the reasoning trail stays intact.
 | **Critical path** | Week 1 Day 6–7 complete — **baseline trained** |
 | **Baseline** | ResNet50, **99.11% test accuracy / 0.9865 macro-F1** on the leak-free holdout |
 | **Built ahead of schedule** | Week 3 A/B testing, most of Week 4 serving |
-| **Tests** | 127 passing, ruff clean |
+| **Tests** | 166 passing, ruff clean |
 | **Dataset** | 54,305 images / 38 classes at `C:\cropguard-data` (outside OneDrive) |
 | **Repo** | github.com/abhinav7289A/CropGuard |
 | **Live API** | https://cropguard-api-w9ch.onrender.com |
@@ -110,6 +110,7 @@ that accuracy would fall, and it did not.
 | `notebooks/01_train_baseline.ipynb` | End-to-end baseline training. Detects Lightning AI vs Colab and sets paths accordingly. |
 | `notebooks/upload_to_hf.py` | Publishes the ONNX graphs and a generated model card to HF Hub. |
 | `render.yaml` | Render Blueprint for the deployed API. |
+| `src/cropguard/monitoring/drift.py` | PSI, KS, TVD drift detection over confidence and class mix. |
 | `app/streamlit_app.py` | Demo UI — upload a leaf, see prediction, confidence, latency. |
 
 ### Tests worth knowing about
@@ -372,6 +373,47 @@ misattributes a cause is worse than no log at all.
 ---
 
 ## 5. Change log
+
+### 2026-08-03 — Drift detection, and a lesson about p-values
+
+`src/cropguard/monitoring/drift.py`. The constraint that shapes it: **you cannot measure
+accuracy in production**, because nobody labels the leaves. What is observable is distribution.
+
+**PSI** on the confidence distribution (inputs drifting off-distribution makes the model hedge)
+and **total variation distance** on the predicted class mix (the population served changed).
+Bin edges come from the *reference* quantiles, never pooled — pooled edges let the current
+distribution redefine the yardstick it is measured against.
+
+**The p-value finding, which is the interesting part.** Split the test set into two random
+halves. Same model, same data, nothing to find by construction:
+
+```
+PSI 0.0028 (stable)     TVD 0.0576 (no shift)
+chi-squared p = 8.35e-09   <- "wildly significant"
+```
+
+The chi-squared p-value reports p ~ 1e-8 on two random halves of identical data. It is not
+broken - it answers "could this difference be zero?", and at n=4,000 the answer is essentially
+always no. So the verdict keys on **effect sizes**, which do not move with sample count. A
+monitor whose sensitivity scales with traffic volume pages at 3am for nothing, gets muted, and
+then misses the real event.
+
+**A design gap the testing exposed.** The first version keyed the verdict on PSI alone. Run
+against tomato-only traffic, class mix collapsed to a single crop while confidence held
+perfectly steady - and the verdict said "no drift". Confidence and class mix are now separate
+signals, because they mean different things: one says the model is struggling, the other says
+the world moved.
+
+**A caveat that bit us directly.** Comparing my class-balanced validation sample against the
+naturally-imbalanced test split reported TVD 0.268 and chi-squared p = 5.7e-256 - entirely an
+artefact of how I sampled, not drift. **Reference and current windows must be sampled the same
+way**, and the failure is silent.
+
+**What it does not do:** none of this proves the model got worse. Input drift means the world
+moved, which may or may not hurt. These are triggers to investigate, not verdicts. Confirming
+real degradation needs labels, which means the /feedback endpoint, which is not built.
+
+Tests: 143 -> 166.
 
 ### 2026-08-02 (quick wins) — Calibration reaches production, and a miscount corrected
 
