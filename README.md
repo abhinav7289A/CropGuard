@@ -6,8 +6,10 @@ and drift monitoring. Runs entirely on free tiers.
 
 > **Live API: https://cropguard-api-w9ch.onrender.com** — `/health` · `/predict` · `/metrics`
 >
-> **Status: baseline trained, evaluated and deployed.** Calibration, the challenger model and
-> drift detection are still open — see [Roadmap](#roadmap).
+> **Status: baseline trained, evaluated, calibrated and deployed.** The ConvNeXt-Tiny
+> challenger has been trained and A/B tested against it — the gate declined to promote it, and
+> [that result](#statistical-model-comparison) is reported as measured. Field-photo evaluation
+> and the `/feedback` loop are the open items — see [Roadmap](#roadmap).
 
 ## Results
 
@@ -234,10 +236,15 @@ hardware, though a weaker "production deployment" story.
 
 ## Experiments
 
-| Config | Backbone | Augmentation | Role |
-|---|---|---|---|
-| `configs/resnet50_baseline.yaml` | ResNet50 | medium | baseline |
-| `configs/convnext_tiny.yaml` | ConvNeXt-Tiny | heavy | challenger |
+| Config | Backbone | Augmentation | Test accuracy | Test macro-F1 | Role |
+|---|---|---|---|---|---|
+| `configs/resnet50_baseline.yaml` | ResNet50 | medium | **0.9911** | 0.9865 | deployed |
+| `configs/convnext_tiny.yaml` | ConvNeXt-Tiny | heavy | 0.9908 | **0.9890** | challenger, not promoted |
+
+The two configs differ in **seven** ways at once — architecture, augmentation, epochs, batch
+size, learning rate, weight decay and dropout — so the comparison answers "which configuration
+should ship", not "is ConvNeXt better than ResNet50". No single variable can be credited, and
+isolating one needs a controlled ablation that is not built.
 
 Configs use single-level `extends: base.yaml` inheritance with a deep merge, so a child can
 override `train.lr` without losing the rest of the `train` block.
@@ -319,13 +326,28 @@ volume pages for nothing, gets muted, and then misses the real event. See
 ## Demo UI
 
 ```bash
-pip install -e ".[demo]"
+pip install -e ".[demo]"          # live API backend only
+pip install -e ".[demo,serve]"    # adds onnxruntime, needed to run models locally
 streamlit run app/streamlit_app.py
 ```
 
-Upload a leaf and get the prediction, top-3, confidence, uncertainty, and both latencies —
-against the live API or a local ONNX model. It shows the confidence ceiling explicitly rather
-than presenting ~0.90 as a calibrated probability.
+Upload a leaf and get the prediction, top-3, confidence, uncertainty and both latencies. The
+backend list is built from [`configs/models.json`](configs/models.json) plus the deployed API,
+and only models whose ONNX file is actually on disk are offered — the panel never lists
+something it cannot run.
+
+Two things it does that a plain demo does not:
+
+- **Compare mode** runs the same image through several models side by side and says whether
+  they agree. On roughly 98.8% of holdout images they do; watching the other 1.2% is a better
+  feel for what "no significant improvement" means than reading a p-value.
+- **A calibration toggle**, because calibration is a serving-time decision rather than a
+  property of the weights. Turning it off shows the raw softmax sitting at the label-smoothing
+  ceiling — the same image goes from 0.76 to 0.99 confidence with the predicted class
+  unchanged, since dividing logits by a positive scalar cannot reorder them.
+
+If `artifacts/ab_comparison.json` is present the panel also surfaces the A/B verdict, so the
+demo reports the comparison rather than only the winner.
 
 ## Statistical model comparison
 
@@ -342,28 +364,56 @@ python -m cropguard.evaluation.compare \
     --out artifacts/comparison.json
 ```
 
+The first real comparison — ResNet50 baseline against the ConvNeXt-Tiny challenger, both
+scored on the identical 8,125-image holdout:
+
 ```
 n=8125 holdout images
-accuracy: A=0.9047  B=0.9294  (diff +0.0246)
-McNemar (chi-squared, continuity corrected): discordant 228 vs 428 (B > A), p=7.9e-15 -> significant
-Bootstrap (10000 resamples): diff=+0.0246, 95% CI [+0.0185, +0.0306] -> excludes 0
-Paired t-test: mean diff=+0.0245, t=6.647, p=8.4e-08 -> significant; d=+1.078 (large)
-Power=1.000 at n=38 -> adequately powered (>=0.8)
-VERDICT: challenger is significantly better
+accuracy: A=0.9911  B=0.9908  (diff -0.0004)
+McNemar (chi-squared (continuity corrected)): discordant pairs 49 vs 46 (A > B), stat=0.0421, p=0.8374 -> not significant at alpha=0.05
+Bootstrap (10000 resamples): diff=-0.0004, 95% CI [-0.0027, +0.0020] -> includes 0
+Paired t-test: mean diff=+0.0037 95% CI [-0.0024, +0.0098], t=1.235, p=0.2248 -> not significant; d=+0.200 (small)
+Power=0.225 at n=38 -> UNDERPOWERED; n=198 needed for 0.8 power at d=0.200
+NOTE: the per-class test is underpowered — a null result here is inconclusive, not evidence of equivalence.
+VERDICT: no significant improvement demonstrated
 ```
+
+**The gate declined to promote, and the challenger was not deployed.** Two things are worth
+reading carefully before treating that as a failure:
+
+- **The two headline metrics disagree.** Accuracy fell by 0.0004 while macro-F1 rose from
+  0.9865 to 0.9890 — and on a 36×-imbalanced problem macro-F1 has the stronger claim to being
+  primary. The challenger traded a little majority-class accuracy for rare-class balance.
+- **The per-class test cannot settle it.** Its sample size is the *class count*: 38 classes at
+  d = 0.200 gives power 0.225, and 0.8 would need 198 classes. No amount of extra labelling
+  fixes that, because the dataset has 38 diseases and always will.
+
+The macro-F1 bootstrap (`bootstrap_macro_f1_difference`) exists to answer the question those
+two points raise — it resamples the 8,125 images and recomputes the macro statistic, so it is
+powered by the holdout rather than by the class count. It was added after the run above, so
+re-running `compare` on the same prediction files now prints a macro-F1 CI alongside the
+accuracy one.
+
+The gate itself stays keyed on accuracy on purpose. The rule was fixed before any challenger
+was trained, and widening it to accept a macro-F1 win *after* seeing which metric moved would
+be picking the test that gives the desired answer. Macro-F1 is measured, printed, and allowed
+to contradict the verdict in public.
 
 - **McNemar's test** — the standard paired test for two classifiers on one holdout. Only
   discordant pairs carry information; it switches to an exact binomial when they are scarce.
-- **Bootstrap CI** — 10,000 paired resamples of the accuracy difference. Both models are
-  resampled on the same indices, which preserves the pairing and tightens the interval.
+- **Bootstrap CI** — 10,000 paired resamples. Both models are resampled on the same indices,
+  which preserves the pairing and tightens the interval. Available for accuracy and, when the
+  prediction files carry predicted classes, for macro-F1.
 - **Per-class paired t-test + Cohen's d_z** — asks whether the gain is spread across classes
   or concentrated in the common ones.
 - **Power analysis** — reported alongside every null result, because "not significant" from an
   underpowered test means *we could not tell*, not *there is no difference*.
 
-`compare` exits non-zero unless the challenger wins, so CI can gate model promotion on
-statistical evidence instead of a raw accuracy delta. Inference runs through the exported ONNX
-graph and the serving preprocessor, so these numbers are the ones production actually produces.
+`compare` exits non-zero unless the challenger wins, and
+[`.github/workflows/promotion-gate.yml`](.github/workflows/promotion-gate.yml) runs it against
+prediction files pulled from the Hub, so promotion is gated on statistical evidence rather than
+a raw accuracy delta. Inference runs through the exported ONNX graph and the serving
+preprocessor, so these numbers are the ones production actually produces.
 
 ## Development
 
@@ -391,7 +441,8 @@ guard against training/serving skew.
 - [x] Leakage ablation: measured, and the inflation is not there
 - [x] Publish weights to HF Hub ([`XiElonMAsk/cropguard-models`](https://huggingface.co/XiElonMAsk/cropguard-models))
 - [x] Deploy to Render — live, with real latency measured
-- [ ] ConvNeXt-Tiny challenger and the first real A/B comparison
+- [x] ConvNeXt-Tiny challenger and the first real A/B comparison — **null result, not promoted**
+- [x] Macro-F1 paired bootstrap, and the promotion gate wired into CI
 - [x] Calibration: temperature scaling, ECE/MCE/Brier, reliability curves
 - [x] Error analysis: Wilson intervals, confusion pairs, confident mistakes
 - [x] Streamlit demo UI
@@ -400,4 +451,23 @@ guard against training/serving skew.
 - [ ] Error and subgroup analysis (lab vs. field photos)
 - [x] Drift detection: PSI on confidence, TVD on class mix
 - [ ] `/feedback` endpoint with retraining triggers
-- [ ] Render deployment, load testing, Grafana dashboard
+- [ ] Load testing and a Grafana dashboard
+
+## Deliberately not built
+
+Several things a "production MLOps pipeline" is expected to have are absent, and their absence
+is a decision rather than an oversight:
+
+| Not built | Why |
+|---|---|
+| **DVC** | The dataset is a single immutable HuggingFace release and the split is *regenerated* from a seed and a sorted file listing, then SHA-256 verified. Versioning 2.2 GB of unchanging images would add a remote to configure and nothing that is not already reproducible. |
+| **MLflow registry** | One trained baseline and one challenger. A registry solves discovery and lineage across many models; with two, `configs/models.json` and the Hub do the same job without a server to run. |
+| **W&B sweeps / Optuna** | Free-tier GPU hours are the binding constraint, and a 20-run Bayesian sweep on a benchmark already at 99.11% would spend them chasing 0.3 points. The ablation that would actually be informative — isolating one of the seven config differences — is the honest use of that compute. |
+| **Automated retraining** | Retraining needs a signal that the model degraded. Drift detection reports that the *inputs* moved, which is not the same thing, and confirming decay needs labels the `/feedback` endpoint would collect. Wiring a retrain trigger to an input-drift alarm would automate a decision the evidence cannot support. |
+| **Grafana / AlertManager** | `/metrics` exports Prometheus format and the drift module computes the numbers. Dashboards over a single free-tier instance serving demo traffic would be decoration. |
+
+The one genuinely missing measurement is **field photographs**: every number here comes from
+lab images with plain backgrounds, and the literature reports large drops on real-world photos
+of the same diseases. Until that is measured, the accuracy figure describes a benchmark rather
+than the problem this project claims to address. That is the top of future work, not a
+deliberate omission.

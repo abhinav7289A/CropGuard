@@ -7,7 +7,7 @@ way, including the decisions that are not obvious from reading the code.
 Every entry is dated. When behaviour changes, the old explanation is not deleted — it is
 marked superseded, so the reasoning trail stays intact.
 
-**Last updated:** 2026-08-01
+**Last updated:** 2026-08-06
 
 ---
 
@@ -15,20 +15,22 @@ marked superseded, so the reasoning trail stays intact.
 
 | | |
 |---|---|
-| **Critical path** | Week 1 Day 6–7 complete — **baseline trained** |
+| **Critical path** | Baseline trained, deployed, calibrated; challenger trained and A/B tested |
 | **Baseline** | ResNet50, **99.11% test accuracy / 0.9865 macro-F1** on the leak-free holdout |
-| **Built ahead of schedule** | Week 3 A/B testing, most of Week 4 serving |
-| **Tests** | 166 passing, ruff clean |
+| **Challenger** | ConvNeXt-Tiny, 99.08% / **0.9890 macro-F1** — gate declined, not promoted |
+| **Tests** | 181 passing, ruff clean |
 | **Dataset** | 54,305 images / 38 classes at `C:\cropguard-data` (outside OneDrive) |
 | **Repo** | github.com/abhinav7289A/CropGuard |
 | **Live API** | https://cropguard-api-w9ch.onrender.com |
 | **Models** | `XiElonMAsk/cropguard-models` on HF Hub |
 
 **Not yet built:** EDA notebook, duplicate detection, DVC, MLflow registry, hyperparameter
-sweeps, augmentation/transfer-learning ablations, calibration, bias analysis, `/feedback`
-endpoint, drift detection, Grafana, load testing, ConvNeXt challenger.
+sweeps, augmentation/transfer-learning ablations, `/feedback` endpoint, Grafana, load testing,
+field-photo (lab vs. real-world) evaluation.
 
-**Calibration and error analysis are now built** — see the 2026-08-02 change-log entry.
+Most of those are now *deliberate* omissions with stated reasons — see "Deliberately not
+built" in the README. The one that is a genuine gap rather than a choice is field-photo
+evaluation.
 
 ### The headline finding so far
 
@@ -375,18 +377,68 @@ misattributes a cause is worse than no log at all.
 
 ## 5. Change log
 
+### 2026-08-06 — The A/B ran, the gate said no, and the two metrics disagreed
+
+The challenger notebook was executed on Colab. **ConvNeXt-Tiny: 0.9908 accuracy, 0.9890
+macro-F1** against the baseline's 0.9911 / 0.9865. McNemar found 49 discordant pairs favouring
+the baseline against 46 favouring the challenger (p = 0.837), the accuracy bootstrap CI spans
+zero, and `compare.py` exited 1. **The challenger was not promoted, and the baseline still
+serves traffic.**
+
+The result is more interesting than a plain null, because the two headline metrics moved in
+opposite directions: accuracy down 0.0004, macro-F1 up 0.0025. The challenger traded a little
+majority-class accuracy for rare-class balance, and on a 36x-imbalanced problem macro-F1 is
+the metric §0 of `brain.md` tells the reader to trust.
+
+**What was missing to settle it.** Neither existing test could. The accuracy bootstrap targets
+the wrong statistic. The per-class t-test does address balance, but its sample size is the
+*class count* - 38 classes at d = 0.200 gives power 0.225, and 0.8 would need 198. That is a
+structural ceiling: no amount of extra labelling fixes it, because the dataset has 38 diseases.
+
+So `bootstrap_macro_f1_difference` was added. It resamples the 8,125 **images** and recomputes
+macro-F1 on each resample, so it is powered by the holdout rather than by the class count, and
+it targets exactly the quantity being claimed. Macro-F1 is not a per-image mean, so the CI has
+to come from recomputation rather than arithmetic on a correctness vector - which is also why
+it needs the predicted classes, not just per-image correctness: recall follows from labels and
+correctness, but precision needs to know *which* wrong class was predicted.
+
+**The gate was deliberately not widened.** It still requires a significant McNemar result in
+the challenger's favour with a bootstrap CI excluding zero - on accuracy. Changing the rule to
+accept a macro-F1 win *after* seeing which metric moved would be choosing the test that gives
+the answer you want. Macro-F1 is measured, printed, and allowed to contradict the verdict;
+`test_the_gate_stays_keyed_on_accuracy_even_when_macro_f1_prefers_the_challenger` pins that
+behaviour so a later refactor cannot quietly soften it.
+
+**Also shipped:** `.github/workflows/promotion-gate.yml` finally wires `compare.py`'s exit code
+into CI - it pulls both prediction files from the Hub, runs the gate, and publishes the report
+whether or not the answer is yes, because a gate that only leaves a trace when it approves is
+not auditable. And `configs/models.json` plus a rewritten Streamlit panel let a visitor pick a
+model, compare two side by side on one image, and toggle calibration on and off.
+
+**Corrections made at the same time.** The README's worked example of `compare` output was
+*illustrative data* invented before any challenger existed, and it read as a real win
+(`VERDICT: challenger is significantly better`). It is now the measured null. The confound
+count in the notebook and change-log entry below said five; the YAMLs differ in **seven**
+(batch size 64->48 and dropout 0.2->0.3 were missed). `convnext_tiny.yaml` claimed its values
+were "refined after the W&B sweep" - there is no sweep. Each of these was a claim that would
+not have survived being checked in an interview.
+
 ### 2026-08-03 (later) — Challenger notebook, and being careful about what it can claim
 
 `notebooks/02_challenger_ab_test.ipynb`: trains ConvNeXt-Tiny, pulls the **deployed** baseline
 from HF Hub rather than retraining it, scores both on the identical holdout, and runs the
 paired comparison.
 
-**The confound, stated up front in the notebook.** The two configs differ in five ways at
-once - architecture, augmentation, epochs, learning rate, weight decay. So the experiment
-answers *"which configuration should ship?"*, which is legitimate and useful. It does **not**
-answer *"is ConvNeXt better than ResNet50"*, because five variables moved together and no
-single one can be credited. Isolating any one needs a controlled ablation, which is Week 2
-work and is not built.
+**The confound, stated up front in the notebook.** The two configs differ in seven ways at
+once - architecture, augmentation, epochs, batch size, learning rate, weight decay and
+dropout. So the experiment answers *"which configuration should ship?"*, which is legitimate
+and useful. It does **not** answer *"is ConvNeXt better than ResNet50"*, because seven
+variables moved together and no single one can be credited. Isolating any one needs a
+controlled ablation, which is not built.
+
+*Correction (2026-08-06):* this entry and the notebook both originally said five. Batch size
+(64 -> 48) and dropout (0.2 -> 0.3) were in the YAML and not in the table. A confound count
+that undercounts is worse than none, since it is offered as the honest caveat.
 
 This is worth being explicit about because the overclaim is the natural thing to say and
 exactly what an interviewer probes.

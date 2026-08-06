@@ -8,6 +8,11 @@ Usage:
 
 Exit code is 0 when the challenger wins on the paired tests and 1 otherwise, so CI can gate
 model promotion on statistical evidence rather than a raw accuracy delta.
+
+The gate is keyed on accuracy. Macro-F1 and its bootstrap CI are computed and printed whenever
+the prediction files carry per-image predicted classes, because on an imbalanced problem the
+two can move in opposite directions — but the exit code does not follow macro-F1, since that
+rule was not the one fixed in advance.
 """
 
 from __future__ import annotations
@@ -55,6 +60,8 @@ def main() -> None:
         labels=baseline["labels"],
         n_resamples=args.resamples,
         seed=args.seed,
+        predictions_a=baseline.get("predictions"),
+        predictions_b=challenger.get("predictions"),
     )
 
     print(f"baseline   : {args.baseline}")

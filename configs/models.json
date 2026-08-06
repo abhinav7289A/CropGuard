@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "Servable models, for the demo panel and for anything else that needs to name a model",
+    "rather than a file path. Test metrics are the measured holdout figures and must not be",
+    "edited to match expectations; a model with no measured number carries null, not a guess.",
+    "`temperature` is the value fitted on that model's own validation split by",
+    "cropguard.evaluation.calibrate — sharing a temperature between models is not valid."
+  ],
+  "classes": "configs/classes.json",
+  "models": [
+    {
+      "id": "resnet50-baseline",
+      "name": "ResNet50 baseline",
+      "file": "models/cropguard.onnx",
+      "hub_file": "cropguard.onnx",
+      "architecture": "ResNet50, ImageNet-pretrained, medium augmentation, 12 epochs",
+      "model_version": "resnet50-baseline-grouped-v1",
+      "temperature": 0.591,
+      "role": "production",
+      "test": { "accuracy": 0.9911, "macro_f1": 0.9865, "n": 8125 },
+      "note": "The deployed model. Serves traffic on Render."
+    },
+    {
+      "id": "convnext-tiny-challenger",
+      "name": "ConvNeXt-Tiny challenger",
+      "file": "models/challenger.onnx",
+      "hub_file": "challenger.onnx",
+      "architecture": "ConvNeXt-Tiny, heavy augmentation, 30 epochs (best at 8)",
+      "model_version": "convnext-tiny-challenger-v1",
+      "temperature": 0.5914,
+      "role": "challenger",
+      "test": { "accuracy": 0.9908, "macro_f1": 0.989, "n": 8125 },
+      "note": "Higher macro-F1, marginally lower accuracy. The promotion gate declined it."
+    },
+    {
+      "id": "resnet50-static-int8",
+      "name": "ResNet50 static INT8",
+      "file": "models/cropguard.static-int8.onnx",
+      "hub_file": null,
+      "architecture": "ResNet50 baseline, statically quantised (QLinearConv)",
+      "model_version": "resnet50-static-int8",
+      "temperature": 0.591,
+      "role": "experiment",
+      "test": null,
+      "note": "Accuracy-neutral against fp32 on a 3,000-image subset (0.9897 vs 0.9893, 9 disagreements), but not evaluated on the full holdout, so no headline figure is claimed. Not deployed: 3.2x slower than fp32 on a CPU without VNNI."
+    }
+  ]
+}

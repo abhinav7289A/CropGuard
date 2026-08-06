@@ -1,0 +1,100 @@
+# The statistical promotion gate.
+#
+# compare.py exits 0 only when the challenger wins the paired tests, so the gate is the exit
+# code — CI adds enforcement, not judgement. Nothing here re-derives a verdict, which is
+# deliberate: a second implementation of the decision rule is a second thing to keep in sync.
+#
+# It runs on demand rather than on push because it needs prediction files that are produced by
+# a GPU training run, not by the repo. Both sets are pulled from the Hub so the comparison is
+# always against the artifact that actually served traffic.
+name: Promotion gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo:
+        description: "HF Hub repo holding the prediction files"
+        default: "XiElonMAsk/cropguard-models"
+        required: true
+      baseline:
+        description: "Baseline predictions (.npz) in that repo"
+        default: "preds_baseline.npz"
+        required: true
+      challenger:
+        description: "Challenger predictions (.npz) in that repo"
+        default: "preds_challenger.npz"
+        required: true
+      resamples:
+        description: "Bootstrap resamples"
+        default: "10000"
+        required: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # The eval extra is torch-free by design, so the gate runs in seconds on a CPU runner.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[eval]" huggingface_hub
+
+      - name: Fetch predictions
+        env:
+          HF_REPO: ${{ inputs.hf_repo }}
+          BASELINE: ${{ inputs.baseline }}
+          CHALLENGER: ${{ inputs.challenger }}
+        run: |
+          python - <<'PY'
+          import os, shutil
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+
+          Path("artifacts").mkdir(exist_ok=True)
+          for name in (os.environ["BASELINE"], os.environ["CHALLENGER"]):
+              src = hf_hub_download(repo_id=os.environ["HF_REPO"], filename=name)
+              shutil.copy(src, Path("artifacts") / Path(name).name)
+              print(f"fetched {name}")
+          PY
+
+      # compare.py asserts the two files cover the same images in the same order before it
+      # tests anything — a paired test across different holdouts is not a weaker result, it
+      # is a meaningless one, so that check failing must stop the job here.
+      - name: Run the gate
+        id: gate
+        run: |
+          set -o pipefail
+          python -m cropguard.evaluation.compare \
+            --baseline "artifacts/$(basename '${{ inputs.baseline }}')" \
+            --challenger "artifacts/$(basename '${{ inputs.challenger }}')" \
+            --resamples "${{ inputs.resamples }}" \
+            --out artifacts/ab_comparison.json | tee artifacts/gate.log
+
+      # `always()` so a declined promotion still publishes its evidence. A gate that only
+      # leaves a trace when it says yes is not auditable.
+      - name: Publish the report
+        if: always()
+        run: |
+          {
+            echo '## Promotion gate'
+            echo
+            echo '```'
+            cat artifacts/gate.log 2>/dev/null || echo 'gate did not produce output'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ab-comparison
+          path: |
+            artifacts/ab_comparison.json
+            artifacts/gate.log
+          if-no-files-found: warn

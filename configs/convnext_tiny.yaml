@@ -1,4 +1,9 @@
-# Challenger: ConvNeXt-Tiny, heavy augmentation. Final config refined after the W&B sweep.
+# Challenger: ConvNeXt-Tiny, heavy augmentation.
+#
+# These values are the timm/ConvNeXt reference recipe (low LR, high weight decay, heavy
+# augmentation), not the output of a search — no sweep has been run. Seven settings differ
+# from the baseline, so an A/B against it answers "which configuration should ship" and not
+# "which architecture is better".
 extends: base.yaml
 
 experiment_name: convnext-tiny-challenger

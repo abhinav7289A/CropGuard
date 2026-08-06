@@ -243,6 +243,114 @@ def bootstrap_accuracy_difference(
     )
 
 
+def f1_per_class(labels: np.ndarray, predictions: np.ndarray, n_classes: int) -> np.ndarray:
+    """Per-class F1 from a single pass of bincounts.
+
+    F1 = 2TP / (2TP + FP + FN), and since `predicted_count` is TP+FP and `true_count` is
+    TP+FN, the denominator is just their sum — no confusion matrix needs materialising.
+    Classes absent from both the labels and the predictions score 0 and are filtered out by
+    the caller rather than here, so this stays a pure per-class view.
+    """
+    labels = np.asarray(labels, dtype=np.int64)
+    predictions = np.asarray(predictions, dtype=np.int64)
+
+    true_positive = np.bincount(labels[labels == predictions], minlength=n_classes)
+    predicted_count = np.bincount(predictions, minlength=n_classes)
+    true_count = np.bincount(labels, minlength=n_classes)
+
+    denominator = predicted_count + true_count
+    return np.where(denominator > 0, 2 * true_positive / np.maximum(denominator, 1), 0.0)
+
+
+def macro_f1(labels: np.ndarray, predictions: np.ndarray, n_classes: int | None = None) -> float:
+    """Unweighted mean F1 over the classes present in `labels`.
+
+    Averaging over *present* classes rather than all `n_classes` matters inside a bootstrap:
+    a resample that happens to omit a rare class should not be scored as if the model failed
+    that class. On the full holdout every class is present, so this agrees with the training
+    metric it is meant to reproduce.
+    """
+    labels = np.asarray(labels, dtype=np.int64)
+    predictions = np.asarray(predictions, dtype=np.int64)
+    if labels.shape != predictions.shape:
+        raise ValueError(f"Shape mismatch: {labels.shape} vs {predictions.shape}")
+    if labels.size == 0:
+        raise ValueError("Empty label array")
+
+    if n_classes is None:
+        n_classes = int(max(labels.max(), predictions.max())) + 1
+
+    scores = f1_per_class(labels, predictions, n_classes)
+    present = np.bincount(labels, minlength=n_classes) > 0
+    return float(scores[present].mean())
+
+
+def bootstrap_macro_f1_difference(
+    labels: np.ndarray,
+    predictions_a: np.ndarray,
+    predictions_b: np.ndarray,
+    n_resamples: int = 10_000,
+    confidence: float = 0.95,
+    seed: int = 42,
+) -> BootstrapResult:
+    """Percentile CI for macro_f1(B) - macro_f1(A), resampling images with replacement.
+
+    This exists because the accuracy bootstrap and the per-class t-test each answer the wrong
+    question about a macro metric. Accuracy is support-weighted, so a challenger that fixes
+    rare classes and loses a little on common ones can improve macro-F1 while accuracy falls.
+    The per-class t-test does address balance, but its sample size is the *class count* — with
+    38 classes it cannot reach 0.8 power at a small effect no matter how many images were
+    labelled, so a null from it is uninformative by construction.
+
+    Resampling images and recomputing the macro statistic sidesteps both: it is powered by the
+    8,000-odd holdout images, and it targets exactly the quantity being claimed. Macro-F1 is
+    not a per-image mean, so the CI has to be built by recomputation rather than arithmetic on
+    a correctness vector.
+
+    Indices are drawn one resample at a time rather than as a single (n_resamples, n) matrix:
+    that matrix is hundreds of megabytes at production sizes, and the per-row draw costs
+    nothing next to recomputing the statistic.
+    """
+    labels = np.asarray(labels, dtype=np.int64)
+    a = np.asarray(predictions_a, dtype=np.int64)
+    b = np.asarray(predictions_b, dtype=np.int64)
+    if not (labels.shape == a.shape == b.shape):
+        raise ValueError(f"Shape mismatch: {labels.shape}, {a.shape}, {b.shape}")
+    if labels.size == 0:
+        raise ValueError("Empty holdout set")
+
+    n = labels.size
+    n_classes = int(max(labels.max(), a.max(), b.max())) + 1
+    observed = macro_f1(labels, b, n_classes) - macro_f1(labels, a, n_classes)
+
+    rng = np.random.default_rng(seed)
+    differences = np.empty(n_resamples, dtype=np.float64)
+    for i in range(n_resamples):
+        indices = rng.integers(0, n, size=n)
+        resampled_labels = labels[indices]
+        # Both models are scored on the identical resample, which preserves the pairing.
+        differences[i] = macro_f1(resampled_labels, b[indices], n_classes) - macro_f1(
+            resampled_labels, a[indices], n_classes
+        )
+
+    tail = (1 - confidence) / 2
+    ci_low, ci_high = np.percentile(differences, [100 * tail, 100 * (1 - tail)])
+
+    proportion = (
+        float(np.mean(differences <= 0)) if observed > 0 else float(np.mean(differences >= 0))
+    )
+    p_value = min(1.0, 2 * proportion)
+
+    return BootstrapResult(
+        observed_difference=float(observed),
+        ci_low=float(ci_low),
+        ci_high=float(ci_high),
+        n_resamples=n_resamples,
+        confidence=confidence,
+        p_value=p_value,
+    )
+
+
 @dataclass
 class PowerResult:
     effect_size: float
@@ -317,15 +425,35 @@ class ComparisonResult:
     bootstrap: BootstrapResult
     per_class: PairedTTestResult | None = None
     power: PowerResult | None = None
+    macro_f1_a: float | None = None
+    macro_f1_b: float | None = None
+    macro_f1_bootstrap: BootstrapResult | None = None
     notes: list[str] = field(default_factory=list)
 
     @property
     def challenger_is_better(self) -> bool:
-        """Significant on the paired test AND the CI excludes no-difference."""
+        """The promotion gate: significant on McNemar, in B's favour, and the CI excludes 0.
+
+        Deliberately keyed on per-image accuracy and deliberately *not* widened to accept a
+        macro-F1 win instead. The rule was fixed before any challenger was trained; loosening
+        it now, having seen that macro-F1 is the metric that moved, would be choosing the test
+        that gives the desired answer. Macro-F1 is measured and reported alongside — see
+        `macro_f1_favours_challenger` — so the disagreement is visible rather than resolved by
+        whichever definition happens to flatter the new model.
+        """
         return (
             self.mcnemar.p_value < ALPHA
             and self.mcnemar.only_b_correct > self.mcnemar.only_a_correct
             and self.bootstrap.excludes_zero
+        )
+
+    @property
+    def macro_f1_favours_challenger(self) -> bool:
+        """Whether the macro-F1 gain is larger than resampling noise. Reported, not gating."""
+        return (
+            self.macro_f1_bootstrap is not None
+            and self.macro_f1_bootstrap.excludes_zero
+            and self.macro_f1_bootstrap.observed_difference > 0
         )
 
     def summary(self) -> str:
@@ -333,9 +461,16 @@ class ComparisonResult:
             f"n={self.n_images} holdout images",
             f"accuracy: A={self.accuracy_a:.4f}  B={self.accuracy_b:.4f}  "
             f"(diff {self.accuracy_b - self.accuracy_a:+.4f})",
-            self.mcnemar.summary(),
-            self.bootstrap.summary(),
         ]
+        if self.macro_f1_a is not None and self.macro_f1_b is not None:
+            lines.append(
+                f"macro-F1: A={self.macro_f1_a:.4f}  B={self.macro_f1_b:.4f}  "
+                f"(diff {self.macro_f1_b - self.macro_f1_a:+.4f})"
+            )
+        lines.append(self.mcnemar.summary())
+        lines.append(self.bootstrap.summary())
+        if self.macro_f1_bootstrap is not None:
+            lines.append("macro-F1 " + self.macro_f1_bootstrap.summary())
         if self.per_class is not None:
             lines.append(self.per_class.summary())
         if self.power is not None:
@@ -358,11 +493,15 @@ def compare_models(
     labels: np.ndarray | None = None,
     n_resamples: int = 10_000,
     seed: int = 42,
+    predictions_a: np.ndarray | None = None,
+    predictions_b: np.ndarray | None = None,
 ) -> ComparisonResult:
     """Run the full battery: McNemar, bootstrap CI, per-class t-test, power analysis.
 
     `correct_a` / `correct_b` are per-image booleans for the same holdout images in the same
-    order. `labels` enables the per-class analysis.
+    order. `labels` enables the per-class analysis. Supplying `predictions_a` / `predictions_b`
+    adds the macro-F1 bootstrap, which cannot be derived from correctness alone: recall follows
+    from labels and correctness, but precision needs to know *which* wrong class was predicted.
     """
     a = np.asarray(correct_a, dtype=bool)
     b = np.asarray(correct_b, dtype=bool)
@@ -397,11 +536,44 @@ def compare_models(
         else:
             notes.append("NOTE: fewer than 2 classes present; per-class analysis skipped.")
 
+    macro_a = macro_b = None
+    macro_bootstrap = None
+    if predictions_a is not None and predictions_b is not None:
+        if labels is None:
+            raise ValueError("labels are required to compute macro-F1")
+        pred_a = np.asarray(predictions_a, dtype=np.int64)
+        pred_b = np.asarray(predictions_b, dtype=np.int64)
+        if not (pred_a.shape == pred_b.shape == a.shape):
+            raise ValueError(f"prediction shapes {pred_a.shape}, {pred_b.shape} do not match")
+
+        n_classes = int(max(labels.max(), pred_a.max(), pred_b.max())) + 1
+        macro_a = macro_f1(labels, pred_a, n_classes)
+        macro_b = macro_f1(labels, pred_b, n_classes)
+        macro_bootstrap = bootstrap_macro_f1_difference(
+            labels, pred_a, pred_b, n_resamples=n_resamples, seed=seed
+        )
+
     if mcnemar_result.n_discordant < 25:
         notes.append(
             f"NOTE: only {mcnemar_result.n_discordant} discordant pairs — the models rarely "
             f"disagree, so this comparison rests on very little evidence."
         )
+
+    # The two headline metrics can point in opposite directions, and when they do it is the
+    # most informative line in the report: the challenger traded common-class accuracy for
+    # rare-class balance. Saying so beats letting a reader assume they agree.
+    if macro_bootstrap is not None:
+        accuracy_delta = float(b.mean() - a.mean())
+        macro_delta = macro_bootstrap.observed_difference
+        if accuracy_delta * macro_delta < 0:
+            direction = (
+                "macro-F1 up, accuracy down" if macro_delta > 0 else "accuracy up, macro-F1 down"
+            )
+            notes.append(
+                f"NOTE: the metrics disagree ({direction}). The gate is keyed on accuracy, so "
+                f"it reports no promotion; on a class-imbalanced problem macro-F1 has the "
+                f"stronger claim to being primary. State both."
+            )
 
     return ComparisonResult(
         n_images=int(a.size),
@@ -411,5 +583,8 @@ def compare_models(
         bootstrap=bootstrap_result,
         per_class=per_class_result,
         power=power_result,
+        macro_f1_a=macro_a,
+        macro_f1_b=macro_b,
+        macro_f1_bootstrap=macro_bootstrap,
         notes=notes,
     )

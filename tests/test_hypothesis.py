@@ -13,8 +13,10 @@ from scipy import stats
 
 from cropguard.evaluation.hypothesis import (
     bootstrap_accuracy_difference,
+    bootstrap_macro_f1_difference,
     compare_models,
     interpret_effect_size,
+    macro_f1,
     mcnemar,
     paired_t_test,
     power_analysis,
@@ -26,6 +28,28 @@ def _correctness(n_both_correct, n_only_a, n_only_b, n_both_wrong):
     a = [True] * n_both_correct + [True] * n_only_a + [False] * n_only_b + [False] * n_both_wrong
     b = [True] * n_both_correct + [False] * n_only_a + [True] * n_only_b + [False] * n_both_wrong
     return np.array(a), np.array(b)
+
+
+def _imbalanced_case():
+    """A 900/50/50 problem where accuracy and macro-F1 rank the two models oppositely.
+
+    A ignores both rare classes and rides the majority: accuracy 0.900, macro-F1 0.316.
+    B sacrifices majority-class accuracy to find them: accuracy 0.890, macro-F1 0.781.
+    This is the real challenger's behaviour in exaggerated form.
+    """
+    labels = np.array([0] * 900 + [1] * 50 + [2] * 50)
+
+    pred_a = np.concatenate([np.zeros(900), np.zeros(50), np.zeros(50)]).astype(np.int64)
+
+    pred_b = np.concatenate(
+        [
+            np.repeat([0, 1], [800, 100]),  # 100 of the majority class lost to class 1
+            np.repeat([1, 0], [45, 5]),
+            np.repeat([2, 0], [45, 5]),
+        ]
+    ).astype(np.int64)
+
+    return labels, pred_a, pred_b
 
 
 # --- McNemar -------------------------------------------------------------------------
@@ -172,6 +196,98 @@ def test_bootstrap_ci_excludes_zero_for_a_large_difference():
     assert result.ci_low > 0
 
 
+# --- Macro-F1 --------------------------------------------------------------------------
+
+
+def test_macro_f1_matches_sklearn():
+    """Checked against an independent implementation, not against our own arithmetic.
+
+    sklearn averages over the union of true and predicted labels by default, while we average
+    over the classes present in the ground truth, so `labels` is passed explicitly to make the
+    two definitions coincide.
+    """
+    from sklearn.metrics import f1_score
+
+    rng = np.random.default_rng(11)
+    labels = rng.integers(0, 8, size=1500)
+    predictions = np.where(rng.random(1500) < 0.75, labels, rng.integers(0, 8, size=1500))
+
+    expected = f1_score(labels, predictions, average="macro", labels=np.unique(labels))
+    assert macro_f1(labels, predictions, n_classes=8) == pytest.approx(expected)
+
+
+def test_macro_f1_is_one_for_perfect_predictions():
+    labels = np.array([0, 1, 2, 2, 1, 0])
+    assert macro_f1(labels, labels) == pytest.approx(1.0)
+
+
+def test_macro_f1_ignores_classes_absent_from_the_ground_truth():
+    """A resample that drops a rare class must not be scored as failing it."""
+    labels = np.array([0, 0, 1, 1])
+    predictions = np.array([0, 0, 1, 1])
+
+    # Class 2 exists in the label space but not in this sample; scoring it 0 would drag
+    # the mean to 0.667 and make every bootstrap resample of a rare class a penalty.
+    assert macro_f1(labels, predictions, n_classes=3) == pytest.approx(1.0)
+
+
+def test_macro_f1_and_accuracy_can_rank_two_models_oppositely():
+    """The reason this statistic exists — the two metrics are not interchangeable."""
+    labels, pred_a, pred_b = _imbalanced_case()
+
+    accuracy_a = float((pred_a == labels).mean())
+    accuracy_b = float((pred_b == labels).mean())
+    macro_a = macro_f1(labels, pred_a, n_classes=3)
+    macro_b = macro_f1(labels, pred_b, n_classes=3)
+
+    assert accuracy_a > accuracy_b
+    assert macro_b > macro_a
+
+
+def test_macro_f1_rejects_mismatched_shapes():
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        macro_f1(np.array([0, 1, 2]), np.array([0, 1]))
+
+
+def test_macro_f1_bootstrap_ci_contains_the_observed_difference():
+    labels, pred_a, pred_b = _imbalanced_case()
+    result = bootstrap_macro_f1_difference(labels, pred_a, pred_b, n_resamples=300, seed=7)
+
+    observed = macro_f1(labels, pred_b, 3) - macro_f1(labels, pred_a, 3)
+    assert result.observed_difference == pytest.approx(observed)
+    assert result.ci_low <= result.observed_difference <= result.ci_high
+
+
+def test_macro_f1_bootstrap_excludes_zero_for_a_clear_difference():
+    labels, pred_a, pred_b = _imbalanced_case()
+    result = bootstrap_macro_f1_difference(labels, pred_a, pred_b, n_resamples=300, seed=5)
+
+    assert result.excludes_zero
+    assert result.ci_low > 0
+
+
+def test_macro_f1_bootstrap_includes_zero_for_identical_models():
+    labels, pred_a, _ = _imbalanced_case()
+    result = bootstrap_macro_f1_difference(labels, pred_a, pred_a, n_resamples=200, seed=3)
+
+    assert result.observed_difference == 0.0
+    assert not result.excludes_zero
+
+
+def test_macro_f1_bootstrap_is_deterministic_for_a_given_seed():
+    labels, pred_a, pred_b = _imbalanced_case()
+    first = bootstrap_macro_f1_difference(labels, pred_a, pred_b, n_resamples=200, seed=42)
+    second = bootstrap_macro_f1_difference(labels, pred_a, pred_b, n_resamples=200, seed=42)
+
+    assert (first.ci_low, first.ci_high) == (second.ci_low, second.ci_high)
+
+
+def test_macro_f1_bootstrap_rejects_mismatched_shapes():
+    labels, pred_a, pred_b = _imbalanced_case()
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        bootstrap_macro_f1_difference(labels, pred_a[:-1], pred_b, n_resamples=10)
+
+
 # --- Power ----------------------------------------------------------------------------
 
 
@@ -271,3 +387,82 @@ def test_comparison_result_is_json_serializable():
     payload = json.dumps(result.to_dict())
 
     assert "mcnemar" in payload and "bootstrap" in payload
+
+
+def test_compare_models_reports_macro_f1_when_predictions_are_supplied():
+    labels, pred_a, pred_b = _imbalanced_case()
+    result = compare_models(
+        pred_a == labels,
+        pred_b == labels,
+        labels,
+        n_resamples=200,
+        predictions_a=pred_a,
+        predictions_b=pred_b,
+    )
+
+    assert result.macro_f1_a == pytest.approx(macro_f1(labels, pred_a, 3))
+    assert result.macro_f1_b == pytest.approx(macro_f1(labels, pred_b, 3))
+    assert result.macro_f1_bootstrap is not None
+    assert "macro-F1" in result.summary()
+
+
+def test_compare_models_omits_macro_f1_when_predictions_are_absent():
+    """Correctness alone cannot give precision, so the statistic must not be faked."""
+    a, b = _correctness(500, 30, 60, 100)
+    result = compare_models(a, b, np.arange(a.size) % 5, n_resamples=200)
+
+    assert result.macro_f1_a is None
+    assert result.macro_f1_bootstrap is None
+    assert not result.macro_f1_favours_challenger
+    assert "macro-F1" not in result.summary()
+
+
+def test_compare_models_requires_labels_for_macro_f1():
+    labels, pred_a, pred_b = _imbalanced_case()
+    with pytest.raises(ValueError, match="labels are required"):
+        compare_models(
+            pred_a == labels,
+            pred_b == labels,
+            labels=None,
+            n_resamples=10,
+            predictions_a=pred_a,
+            predictions_b=pred_b,
+        )
+
+
+def test_the_gate_stays_keyed_on_accuracy_even_when_macro_f1_prefers_the_challenger():
+    """The promotion rule was fixed in advance; a macro-F1 win must not override it.
+
+    This is the honesty property of the whole module: the challenger is better on the metric
+    that suits it, and the gate still declines to promote, because widening the rule after
+    seeing the data is choosing the test that gives the answer you want.
+    """
+    labels, pred_a, pred_b = _imbalanced_case()
+    result = compare_models(
+        pred_a == labels,
+        pred_b == labels,
+        labels,
+        n_resamples=300,
+        predictions_a=pred_a,
+        predictions_b=pred_b,
+    )
+
+    assert result.macro_f1_favours_challenger
+    assert result.accuracy_b < result.accuracy_a
+    assert not result.challenger_is_better
+    assert "no significant improvement" in result.summary()
+
+
+def test_compare_models_flags_when_the_two_metrics_disagree():
+    labels, pred_a, pred_b = _imbalanced_case()
+    result = compare_models(
+        pred_a == labels,
+        pred_b == labels,
+        labels,
+        n_resamples=200,
+        predictions_a=pred_a,
+        predictions_b=pred_b,
+    )
+
+    assert any("metrics disagree" in note for note in result.notes)
+    assert "macro-F1 up, accuracy down" in result.summary()

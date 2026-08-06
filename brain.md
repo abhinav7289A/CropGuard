@@ -7,12 +7,13 @@ and the reasoning you would need to defend under hard questioning from a senior 
 breaks*.
 
 **Scope note:** only built components are covered. **DVC is deliberately absent** — it is not
-in this project yet, so there is nothing here to defend. Likewise no MLflow, hyperparameter
-sweeps, drift detection, or the ConvNeXt challenger. Claiming those in an interview when the
-repo does not contain them is exactly the trap this document exists to avoid.
+in this project, so there is nothing here to defend. Likewise no MLflow, no hyperparameter
+sweeps, no automated retraining, and no field-photo evaluation. Claiming those in an interview
+when the repo does not contain them is exactly the trap this document exists to avoid.
 
-**Results are real and the API is live** (§0, §11). Everything beyond the trained baseline and
-its deployment is still unbuilt, so do not describe it as done.
+**Results are real and the API is live** (§0, §11). The ConvNeXt challenger has been trained
+and A/B tested (§8.10) and drift detection is built (§12); both are covered here because they
+now exist. What is still unbuilt is listed in the README under "Deliberately not built".
 
 ---
 
@@ -29,6 +30,20 @@ ResNet50, 12 epochs, leaf-grouped split, evaluated on the 8,125-image holdout:
 
 Read **macro-F1**, not accuracy: at 36× imbalance accuracy is dominated by the largest
 classes (§4).
+
+### The challenger
+
+ConvNeXt-Tiny was trained and A/B tested against the baseline on the identical holdout. The
+gate **declined to promote it** (McNemar p = 0.837, accuracy CI spans zero), so the ResNet50
+baseline still serves traffic — but the two metrics disagreed, which is the interesting part:
+
+| | Baseline | Challenger |
+|---|---|---|
+| Test accuracy | **0.9911** | 0.9908 |
+| Test macro-F1 | 0.9865 | **0.9890** |
+
+Accuracy down 0.0004, macro-F1 up 0.0025. Full treatment in §8.10, including why the per-class
+test could never have settled it and what was added to fix that.
 
 ### Live deployment
 
@@ -454,9 +469,10 @@ Two things follow:
 2. It confirms the model trained as intended — the observed ceiling matching the closed-form
    prediction to three decimal places is a strong check that the loss did what the maths says.
 
-If asked *"is your model well calibrated?"*: no, and predictably not — label smoothing caps
-confidence by construction, so it is systematically under-confident. The fix is temperature
-scaling fitted on validation, and it is not built yet.
+If asked *"is your model well calibrated?"*: it was not, and predictably not — label smoothing
+caps confidence by construction, so it is systematically under-confident. Temperature scaling
+fitted on validation is the fix; it is built, it is applied in the serving path, and it cut ECE
+from 0.0895 to 0.0036 (§8.8).
 
 ### 7.2 Optimisation
 
@@ -765,6 +781,101 @@ something spurious.
 
 **Why rank confusion pairs by count rather than rate:** a 50% error rate on a 4-image class is
 noise; 8 misroutes out of 149 is a pattern. Both are reported so either reading is available.
+
+---
+
+## 8.10 The challenger — a null, and what it exposed about the metrics
+
+ConvNeXt-Tiny, trained on the same leaf-grouped split and scored on the identical 8,125-image
+holdout, against the deployed ResNet50 baseline.
+
+| | Baseline | Challenger |
+|---|---|---|
+| Test accuracy | **0.9911** | 0.9908 |
+| Test macro-F1 | 0.9865 | **0.9890** |
+| Fitted temperature | 0.591 | 0.5914 |
+
+```
+McNemar: 49 discordant for A vs 46 for B, stat=0.0421, p=0.8374  -> not significant
+Bootstrap: diff=-0.0004, 95% CI [-0.0027, +0.0020]               -> includes 0
+VERDICT: no significant improvement demonstrated                  (exit 1)
+```
+
+**The gate declined and the challenger was not deployed.** That is the framework working. The
+useful content is in what the run exposed.
+
+### The two headline metrics moved in opposite directions
+
+Accuracy fell by 0.0004 while macro-F1 rose by 0.0025. Both are correct; they measure
+different things. Accuracy is support-weighted, so the 5,357-image tomato classes dominate it,
+while macro-F1 gives the 24-image `Potato___healthy` the same vote as the largest class. A
+model that finds a few more rare-class positives at the cost of a few common-class ones moves
+them in opposite directions *by construction*.
+
+§0 tells the reader to read macro-F1 rather than accuracy at 36× imbalance. The promotion gate
+is keyed on accuracy. That inconsistency was invisible until a challenger made the two
+disagree.
+
+### Why neither existing test could settle it
+
+The accuracy bootstrap targets the wrong statistic. The per-class t-test targets roughly the
+right one — mean per-class accuracy rose +0.0037 — but it is **structurally underpowered**:
+
+  `power = 0.225 at n = 38, d = 0.200; n = 198 needed for 0.8`
+
+Its sample size is the *class count*, not the image count. PlantVillage has 38 diseases, so
+198 is unreachable. Labelling ten times more images would not move that number at all. A test
+that cannot reach adequate power on the problem it is applied to cannot produce an informative
+null, which is what the printed NOTE says.
+
+### The fix: bootstrap the macro statistic over images
+
+`bootstrap_macro_f1_difference` resamples the 8,125 images with replacement and recomputes
+macro-F1 on each resample, for both models on the *same* indices:
+
+- It is powered by **8,125** draws rather than 38.
+- It targets exactly the quantity being claimed.
+- It needs the **predicted classes**, not just per-image correctness — recall follows from
+  labels and correctness, but precision requires knowing *which* wrong class was predicted.
+- Macro-F1 is not a per-image mean, so no arithmetic on a correctness vector produces its CI.
+  Recomputation is the only route.
+
+One detail with a reason: each resample averages F1 over classes **present in that resample's
+ground truth**, not over all 38. Otherwise a resample that happened to omit a 24-image class
+would score it zero and be recorded as a failure on a class it never sampled.
+
+### Why the gate was not widened to accept a macro-F1 win
+
+Because the rule was fixed before the challenger existed. Loosening it after seeing which
+metric moved is selecting the test that returns the desired answer — the same error as running
+both a one-tailed and a two-tailed test and reporting whichever clears 0.05. Macro-F1 is
+measured, printed, and permitted to contradict the verdict in public; the gate stays where it
+was. `test_the_gate_stays_keyed_on_accuracy_even_when_macro_f1_prefers_the_challenger` pins
+that so a later refactor cannot quietly soften it.
+
+The defensible way to act on the macro-F1 signal is to pre-register it as primary **before**
+the next challenger trains, and say so in writing. That is a decision about the next
+experiment, not a reinterpretation of this one.
+
+### Two smaller findings
+
+**The temperatures agree.** Two different architectures, fitted independently on their own
+validation splits, landed on T = 0.591 and T = 0.5914. Label smoothing at ε=0.1 over K=38
+caps achievable confidence at 0.9026 regardless of architecture, so the correction needed to
+undo it is a property of the loss, not of the backbone. This is the cleanest available
+evidence that §8.8's explanation of the under-confidence is the right one.
+
+**Ninety-five images carry the entire comparison.** The contingency table is 8,004 both
+correct, 26 both wrong, 49 baseline-only, 46 challenger-only. The 8,030 concordant images
+contribute nothing to McNemar by construction. Any statement about which model is better rests
+on 95 images, which is also why the interval is about as wide as the effect it brackets.
+
+### What this experiment cannot say
+
+Seven settings differ between the two configs — architecture, augmentation, epochs, batch
+size, learning rate, weight decay, dropout. So the answer is about **configurations**, not
+architectures. "ConvNeXt is no better than ResNet50" is not supported by this run and should
+not be said. Isolating a single factor needs a controlled ablation, which is not built.
 
 ---
 
@@ -1129,8 +1240,13 @@ Three jobs on push and PR:
 | Job | Does |
 |---|---|
 | `lint` | `ruff check` + `ruff format --check` |
-| `test` | Installs CPU-only torch, runs 81 tests |
+| `test` | Installs CPU-only torch, runs 181 tests |
 | `docker` | Builds the serving image, runs the container, asserts `/health` responds |
+
+Plus one manual workflow, `promotion-gate.yml`: it pulls two prediction files from the Hub and
+runs `compare.py`, whose exit code decides the job. It is `workflow_dispatch` rather than
+push-triggered because its inputs come from a GPU training run, not from the repo — a gate that
+ran on every commit would either be comparing stale artifacts or blocking on a 3-hour job.
 
 **Design points worth defending:**
 
@@ -1142,10 +1258,14 @@ Three jobs on push and PR:
 - **A placeholder `classes.json`** is generated in CI when absent, since it is a build input
   produced by the data pipeline.
 - **`concurrency` with `cancel-in-progress`** so superseded pushes stop consuming free minutes.
+- **The gate publishes its report on `always()`.** A gate that only leaves an artifact behind
+  when it approves is not auditable — the declined runs are the ones worth reading.
+- **CI enforces the rule, it does not re-implement it.** The workflow reads an exit code and
+  nothing more; a second copy of the decision logic in YAML is a second thing to keep in sync
+  with `hypothesis.py`, and it would drift.
 
-**Not built, do not claim it:** no training job, no model registry gate, no automated
-retraining, no deployment step. `compare.py`'s exit code is *designed* to be that gate, but
-nothing wires it into a workflow yet.
+**Not built, do not claim it:** no training job, no model registry, no automated retraining, no
+deployment step. Promotion is gated but still triggered and applied by hand.
 
 ---
 
@@ -1210,11 +1330,11 @@ Until that gap is measured, the accuracy figure describes a benchmark, not the p
 project claims to address.
 
 After that: `uncertainty` is predictive entropy rather than genuine epistemic uncertainty —
-it cannot flag an input unlike anything in training; the temperature-scaled probabilities are
-computed in evaluation but **not yet applied in the serving path**, so the API still returns
-raw under-confident softmax; there is no multiple-comparisons correction once sweeps begin;
-and ten classes have fewer than 100 test images, so their per-class metrics carry intervals
-too wide to act on.
+it cannot flag an input unlike anything in training; there is no multiple-comparisons
+correction, which becomes a real problem the moment more than one challenger is tested against
+the same holdout; the promotion gate is keyed on accuracy while the documentation tells the
+reader to trust macro-F1 (§8.10); and ten classes have fewer than 100 test images, so their
+per-class metrics carry intervals too wide to act on.
 
 **"Your API takes 3.5 seconds per prediction. Is that acceptable?"**
 Not for an interactive product, and I would not claim otherwise. It is Render's free tier at
@@ -1233,9 +1353,11 @@ than settled on a laptop benchmark, and the deployment confirmed that caution wa
 **"Your model reports 90% confidence on everything. Why?"**
 Label smoothing at 0.1 over 38 classes caps the achievable softmax output at
 (1-eps) + eps/K = 0.9026, and the live API returns a median of 0.9025. That is the loss
-function doing what it is designed to do, not the model being unsure. It also means the
-confidence value should not be shown to a user as a probability until it is recalibrated -
-temperature scaling on the validation set is the fix, and it is not built yet.
+function doing what it is designed to do, not the model being unsure. It also means the raw
+confidence should not be shown to a user as a probability - which is why temperature scaling
+fitted on validation is now applied in the serving path, and why the demo panel lets you
+toggle it off and watch the same image go from 0.76 to 0.99 with the predicted class
+unchanged.
 
 **"Is your model well calibrated?"**
 It was not — ECE 0.0895, and *under*-confident rather than over, which is the less common
@@ -1267,6 +1389,34 @@ own test set the chi-squared p-value comes out at 8e-09, so a p-value-triggered 
 fire constantly on nothing. Neither signal proves degradation though — they say the inputs
 moved, and that is a reason to look, not a verdict. Confirming actual decay needs labelled
 feedback, which is not built.
+
+**"You built an A/B framework and it declined your only challenger. Was that wasted?"**
+The framework's job is to answer the question, not to approve the model. It cost one training
+run to convert "ConvNeXt with a stronger recipe should beat this" from an assumption into a
+measurement, and the measurement came back null with a CI of [-0.0027, +0.0020] — so I know
+the true difference is under a quarter of a point either way, which I did not know before. The
+run also exposed a real inconsistency I would not otherwise have found: my docs say read
+macro-F1, my gate reads accuracy, and nothing surfaced that until a model made them disagree.
+
+**"Your two headline metrics disagree. Which do you believe?"**
+Macro-F1, on this dataset — it is 36× imbalanced and accuracy is dominated by the tomato
+classes. But I did not promote on it, because the gate was fixed on accuracy before the
+challenger existed and widening it after seeing which metric moved is choosing the test that
+gives the answer I want. The honest sequence is: report both, promote on neither, and
+pre-register macro-F1 as primary before the next challenger trains. What I *did* add is a
+bootstrap on the macro-F1 difference, because previously nothing in the battery could tell me
+whether that +0.0025 was real.
+
+**"Why is your per-class t-test underpowered, and can you fix it with more data?"**
+No, and that is the point. Its sample size is the number of *classes*, so at d = 0.200 it
+needs n = 198 and PlantVillage has 38. Ten times the images changes nothing. That is a
+structural ceiling, not a data problem, and it is why the macro-F1 bootstrap resamples images
+instead — 8,125 draws rather than 38, targeting the statistic actually being claimed.
+
+**"How much of your A/B result rests on real evidence?"**
+Ninety-five images. The contingency table is 8,004 both-correct, 26 both-wrong, 49 and 46
+discordant, and McNemar uses only the discordant cells. I would rather state that up front
+than let a reader see "n=8,125" and assume the comparison is that well supported.
 
 **"You're at 99.11%. What would you do next?"**
 Nothing aimed at the accuracy number — the headroom is 0.9% and the remaining errors are
