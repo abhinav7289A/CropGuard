@@ -9,6 +9,9 @@ and drift monitoring. Runs entirely on free tiers.
 >
 > **Live API: https://cropguard-api-w9ch.onrender.com** — `/health` · `/predict` · `/metrics`
 >
+> **Results and limitations: [RESEARCH.md](RESEARCH.md)** — the five-minute version, including
+> the A/B test that declined to promote its challenger
+>
 > **Status: baseline trained, evaluated, calibrated and deployed.** The ConvNeXt-Tiny
 > challenger has been trained and A/B tested against it — the gate declined to promote it, and
 > [that result](#statistical-model-comparison) is reported as measured. Field-photo evaluation
@@ -69,11 +72,29 @@ flowchart TD
     C --> D[leaf-grouped split 70/15/15 → splits.json]
     D --> E[Lightning training · timm backbone]
     E -->|W&B: metrics, artifacts| F[checkpoint]
-    F --> G[ONNX export + parity check]
+    F --> G[ONNX export + parity check &lt;1e-3]
+
+    G --> P[predict over holdout → preds.npz]
+    P --> K[temperature scaling on val → T]
+    P --> Q[McNemar · bootstrap CI · power]
+    Q --> R{promotion gate<br/>exit 0 = promote}
+    R -->|declined| S[baseline keeps serving]
+    R -->|promoted| H
+
     G --> H[FastAPI + ONNX Runtime]
-    H --> I[/predict · /health · /metrics/]
-    I --> J[Prometheus → Grafana]
+    K -->|T applied at serve time| H
+    H --> I[/"predict · predict/batch · health · metrics"/]
+    I --> J[Prometheus metrics]
+    I --> L[PSI on confidence · TVD on class mix]
+    L -.->|effect size over threshold| M[investigate — not auto-retrain]
+    H --> N[Streamlit panel · model registry]
 ```
+
+The gate is the part worth pointing at: `compare.py` exits non-zero unless the challenger wins
+the paired tests, and `promotion-gate.yml` runs it in CI. Promotion is a measurement, not a
+judgement call. The drift edge is dashed on purpose — it opens an investigation rather than
+triggering a retrain, because input drift is not evidence that accuracy fell (see
+[RESEARCH.md §7](RESEARCH.md)).
 
 The repo is split by runtime environment so the serving image never pulls in torch:
 
