@@ -397,7 +397,11 @@ structural ceiling: no amount of extra labelling fixes it, because the dataset h
 
 So `bootstrap_macro_f1_difference` was added. It resamples the 8,125 **images** and recomputes
 macro-F1 on each resample, so it is powered by the holdout rather than by the class count, and
-it targets exactly the quantity being claimed. Macro-F1 is not a per-image mean, so the CI has
+it targets exactly the quantity being claimed. Run on the real prediction files it returns
+**+0.0025, 95% CI [-0.0015, +0.0067]** - the interval spans zero, so the macro-F1 gain does not
+survive resampling and the challenger is not better on either metric. The gate's verdict is
+unchanged, but the *quality* of the null is: it went from "underpowered, could not tell" to a
+tight bound on how large any real difference could be. Macro-F1 is not a per-image mean, so the CI has
 to come from recomputation rather than arithmetic on a correctness vector - which is also why
 it needs the predicted classes, not just per-image correctness: recall follows from labels and
 correctness, but precision needs to know *which* wrong class was predicted.
@@ -414,6 +418,43 @@ into CI - it pulls both prediction files from the Hub, runs the gate, and publis
 whether or not the answer is yes, because a gate that only leaves a trace when it approves is
 not auditable. And `configs/models.json` plus a rewritten Streamlit panel let a visitor pick a
 model, compare two side by side on one image, and toggle calibration on and off.
+
+**The demo panel is now live** at
+[huggingface.co/spaces/XiElonMAsk/cropguard](https://huggingface.co/spaces/XiElonMAsk/cropguard).
+Two things about that deployment are worth recording:
+
+- **It is a Docker Space, not a Streamlit one.** The Hub rejects `streamlit` as an SDK for new
+  Spaces now - `Invalid option: expected one of "gradio"|"docker"|"static"` - so
+  `spaces/Dockerfile` runs Streamlit itself on port 7860. The app is unchanged.
+- **Weights are fetched, not uploaded.** `scripts/deploy_space.py` ships 34 KB: the app, two
+  configs, the Dockerfile and the torch-free serving package. The panel pulls ONNX files from
+  the model repo on first use, so the demo and the API load the same artifact and a new model
+  never has to be copied to two places.
+
+**Static INT8 is now published**, reversing the earlier decision to ship only fp32. The reason
+that decision existed was that the benchmark which would settle INT8-versus-fp32 has to be
+taken on the deployment target, and a laptop without VNNI instructions could not take it
+(§9.3). Putting both files in the demo panel *is* how that measurement gets taken - so
+publishing it follows the original reasoning rather than abandoning it. fp32 still serves the
+API; nothing is promoted on the strength of an argument about instruction sets.
+
+It also gives the panel two models to compare today. The ConvNeXt challenger cannot fill that
+role yet because `models/challenger.onnx` exists only in the Colab session's Drive folder and
+was never brought down - a reminder that an artifact which only exists on ephemeral compute is
+not really an artifact.
+
+**Spaces now requires PRO for Docker and Gradio Spaces on free cpu-basic** (`402 Payment
+Required` on repo creation), and no longer accepts `streamlit` as an SDK at all. A second
+account without PRO could not host the panel, so the Space and the weights both live in the
+one account that can - deliberately in the *same* account, so the demo has no cross-account
+dependency that a future cleanup could break.
+
+The registry distinguishes **available** (on disk) from **fetchable** (on the Hub). They are
+tracked separately because on a Space nothing is on disk at startup, so collapsing them into
+one boolean would have made the panel offer no models at all. `hub_files()` also checks what
+the model repo actually contains and hides anything missing - which is currently the ConvNeXt
+challenger, since only the baseline has been published. An unreachable Hub returns `None` and
+is deliberately not treated as "the file is absent": failure to reach a server is not evidence.
 
 **Corrections made at the same time.** The README's worked example of `compare` output was
 *illustrative data* invented before any challenger existed, and it read as a real win

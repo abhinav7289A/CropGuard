@@ -1,0 +1,10 @@
+# Runtime for the Hugging Face Space (Spaces installs requirements.txt, not the optional
+# dependency extras in pyproject.toml). Deliberately the serving subset only: the panel runs
+# ONNX inference and never imports torch, which is what keeps the Space's cold start short.
+#
+# For local development use the extras instead: pip install -e ".[demo,serve]"
+streamlit>=1.35
+onnxruntime>=1.17
+numpy>=1.26,<3
+pillow>=10.0
+huggingface_hub>=0.23

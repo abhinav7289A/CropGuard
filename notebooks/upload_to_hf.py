@@ -76,13 +76,22 @@ end-to-end MLOps pipeline.
 Macro-F1 is the metric to read here, not accuracy: the dataset is imbalanced ~36x, so accuracy
 is dominated by the largest classes.
 
-**Only `cropguard.onnx` (fp32) is published.** Dynamic INT8 quantization was tried and is
-*not* shipped: `quantize_dynamic` rewrites every `Conv` into `ConvInteger`, which ONNX
-Runtime's CPU backend has no optimized kernel for. Measured on an Intel Alder Lake CPU it ran
-at **1567 ms/image against 19 ms/image for fp32** - a 75x regression in exchange for 4x less
-disk. Dynamic quantization suits MatMul-dominated models (Transformers, RNNs), not CNNs; the
-correct approach for a Conv-heavy network is *static* quantization with a calibration set,
-which emits the optimized `QLinearConv`. That is not built yet.
+**`cropguard.onnx` (fp32) is the model that serves traffic.** `cropguard.static-int8.onnx` is
+published alongside it for comparison; the **dynamic** INT8 build is deliberately *not*
+published.
+
+Dynamic quantization was the wrong tool here. `quantize_dynamic` rewrites every `Conv` into
+`ConvInteger`, which ONNX Runtime's CPU backend has no optimized kernel for: measured on an
+Intel Alder Lake CPU it ran at **1567 ms/image against 19 ms for fp32**, a 75x regression in
+exchange for 4x less disk. It suits MatMul-dominated models (Transformers, RNNs), not CNNs.
+
+*Static* quantization with a calibration set emits the optimized `QLinearConv` instead, and is
+**78 ms/image** - 20x faster than dynamic and accuracy-neutral (0.9897 vs 0.9893 on a 3,000
+image subset, 9 disagreements). It is still 3.2x slower than fp32 on the machine it was
+measured on, and the reason is hardware rather than the graph: that CPU has no VNNI
+instructions, without which ONNX Runtime emulates each INT8 multiply-accumulate in several
+AVX2 instructions. Server CPUs usually do have VNNI, where the ranking may reverse - which is
+exactly why both files are here to be benchmarked on whatever hardware you are running.
 
 ## The split is grouped by leaf, and that matters
 
@@ -119,9 +128,12 @@ PlantVillage capture protocol.
   images; the smallest (`Potato___healthy`) has 24. A recall of 0.833 there is 4 mistakes, and
   its confidence interval spans roughly +/-15 points. Do not read those per-class numbers as
   precise.
-- **Confidence is not calibrated.** Training used label smoothing (0.1), which deliberately
-  caps confidence, so predicted probabilities are expected to understate. No temperature
-  scaling has been fitted.
+- **The raw softmax is not calibrated.** Training used label smoothing (0.1), which caps
+  achievable confidence at (1-eps) + eps/K = 0.9026 and leaves the model systematically
+  *under*-confident. Temperature scaling fitted on the validation split (T = 0.591) cuts
+  expected calibration error from 0.0895 to 0.0036 and is applied in the serving path, but the
+  ONNX graph published here emits **logits** - apply the temperature yourself, or the
+  probabilities you compute from it will understate.
 - **`uncertainty` is predictive entropy**, not epistemic uncertainty. It cannot distinguish an
   ambiguous input from one far outside the training distribution - an out-of-distribution
   image can produce confidently wrong output with low entropy.
@@ -157,7 +169,8 @@ detection*, Frontiers in Plant Science.
 """
 
 # ---------------------------------------------------------------- upload
-token = getpass("HF write token (https://hf.co/settings/tokens): ")
+# Env first so this runs unattended from a script or CI; the prompt is the notebook path.
+token = os.environ.get("HF_TOKEN") or getpass("HF write token (https://hf.co/settings/tokens): ")
 create_repo(REPO_ID, repo_type="model", exist_ok=True, token=token)
 api = HfApi()
 
@@ -167,6 +180,14 @@ Path("MODEL_CARD.md").write_text(card, encoding="utf-8")
 # quantization makes it genuinely better.
 uploads = [
     ("models/cropguard.onnx", "cropguard.onnx"),
+    # The challenger goes up even though it was not promoted: the demo Space offers it as a
+    # second model and pulls both from here, so "the model that lost" still has to be
+    # fetchable. Skipped automatically when the file is absent.
+    ("models/challenger.onnx", "challenger.onnx"),
+    # Static INT8 - published, unlike the dynamic build. §9 says the benchmark that decides it
+    # has to be taken on the deployment target, and serving it from the Space is how that
+    # measurement finally gets taken.
+    ("models/cropguard.static-int8.onnx", "cropguard.static-int8.onnx"),
     ("configs/classes.json", "classes.json"),
     ("MODEL_CARD.md", "README.md"),
 ]

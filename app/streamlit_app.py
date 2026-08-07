@@ -99,17 +99,81 @@ st.markdown(STYLE, unsafe_allow_html=True)
 # --------------------------------------------------------------------------- registry
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=600)
+def hub_files(repo: str | None) -> set[str] | None:
+    """Filenames in the model repo, or None if the Hub could not be reached.
+
+    None and the empty set mean different things and must not be conflated: an unreachable Hub
+    is no evidence that a file is absent, so the caller keeps trusting the registry in that
+    case. A successful listing that lacks the file *is* evidence, and the model is hidden.
+    The TTL lets a newly uploaded model appear without redeploying the Space.
+    """
+    if not repo:
+        return None
+    try:
+        from huggingface_hub import HfApi
+
+        return set(HfApi().list_repo_files(repo))
+    except Exception:  # noqa: BLE001 — offline is a normal state for the local demo
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=600)
 def load_registry() -> list[dict]:
-    """Models declared in configs/models.json, annotated with whether the file is present."""
+    """Models declared in configs/models.json, annotated with how they can be obtained.
+
+    `available` means runnable *now* without a download; `fetchable` means the weights are on
+    the Hub and will be pulled on first use. On Spaces nothing is on disk at startup, so every
+    model is fetchable and none is available — which is why the two are tracked separately
+    rather than collapsed into one boolean.
+
+    The TTL is the load-bearing part and belongs *here*, not only on `hub_files`. This function
+    caches the *derived* answer, so without its own expiry it pins whatever the Hub said when
+    the container booted: a model published afterwards stays invisible until the Space is
+    restarted, no matter how short the inner TTL is. That is exactly what happened once.
+    """
     with open(REGISTRY_PATH, encoding="utf-8") as f:
         registry = json.load(f)
+
+    hub_repo = registry.get("hub_repo")
+    published = hub_files(hub_repo)
 
     models = []
     for entry in registry["models"]:
         path = REPO_ROOT / entry["file"]
-        models.append({**entry, "path": path, "available": path.exists()})
+        hub_file = entry.get("hub_file")
+        fetchable = bool(hub_repo and hub_file) and (published is None or hub_file in published)
+        models.append(
+            {
+                **entry,
+                "path": path,
+                "hub_repo": hub_repo,
+                "available": path.exists(),
+                "fetchable": fetchable,
+            }
+        )
     return models
+
+
+@st.cache_resource(show_spinner="Downloading weights from the Hub (first run only)...")
+def resolve_weights(model_id: str) -> str:
+    """Local path to the ONNX file, downloading from the Hub if it is not already here.
+
+    Cached as a resource so the ~95 MB download happens once per container rather than once
+    per session. hf_hub_download caches to disk as well, so a restarted Space that kept its
+    layer cache does not re-fetch.
+    """
+    entry = next(m for m in load_registry() if m["id"] == model_id)
+    if entry["available"]:
+        return str(entry["path"])
+    if not entry["fetchable"]:
+        raise FileNotFoundError(
+            f"{entry['name']} is not on disk and has no hub_file in configs/models.json"
+        )
+
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=entry["hub_repo"], filename=entry["hub_file"])
 
 
 @st.cache_resource(show_spinner=False)
@@ -120,7 +184,8 @@ def load_local_model(model_id: str, temperature: float):
     from cropguard.serving.model_loader import CropGuardModel
 
     entry = next(m for m in load_registry() if m["id"] == model_id)
-    return CropGuardModel(entry["path"], CLASSES_PATH, entry["model_version"], temperature)
+    weights = resolve_weights(model_id)
+    return CropGuardModel(weights, CLASSES_PATH, entry["model_version"], temperature)
 
 
 def predict_local(model_id: str, temperature: float, image_bytes: bytes) -> tuple[dict, float]:
@@ -205,15 +270,119 @@ def label_for(choice: str, models: list[dict]) -> str:
     return next(m["name"] for m in models if m["id"] == choice)
 
 
+# ---- the A/B verdict ------------------------------------------------------------------
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def load_comparison() -> dict | None:
+    """The A/B report: local if this is a checkout, from the Hub if this is a Space."""
+    if COMPARISON_PATH.exists():
+        with open(COMPARISON_PATH, encoding="utf-8") as f:
+            return json.load(f)
+
+    registry_hub = next((m["hub_repo"] for m in models if m.get("hub_repo")), None)
+    if not registry_hub:
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+
+        with open(hf_hub_download(registry_hub, "ab_comparison.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001 — the report is a bonus, never a hard dependency
+        return None
+
+
+def render_comparison_report() -> None:
+    """The A/B verdict. Rendered whether or not an image has been uploaded — it is a result
+    about the models, not about anyone's leaf, and hiding it behind the uploader buried the
+    most substantive thing on the page."""
+    report = load_comparison()
+    if report is None:
+        return
+
+    verdict_is_win = (
+        report["mcnemar"]["p_value"] < 0.05
+        and report["mcnemar"]["only_b_correct"] > report["mcnemar"]["only_a_correct"]
+        and not (report["bootstrap"]["ci_low"] <= 0 <= report["bootstrap"]["ci_high"])
+    )
+    headline = (
+        "challenger promoted" if verdict_is_win else "no significant improvement — not promoted"
+    )
+
+    with st.expander(f"A/B test: ResNet50 vs ConvNeXt-Tiny — {headline}", expanded=False):
+        st.markdown(
+            "Both models scored on the identical holdout, image by image. The tests are "
+            "**paired**, which is what makes them sensitive — and void if the two ever saw "
+            "different test sets, so `compare.py` asserts that before testing anything."
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(
+                tile("Accuracy", f"{report['accuracy_a']:.4f} → {report['accuracy_b']:.4f}"),
+                unsafe_allow_html=True,
+            )
+        with c2:
+            if report.get("macro_f1_a") is not None:
+                st.markdown(
+                    tile("Macro-F1", f"{report['macro_f1_a']:.4f} → {report['macro_f1_b']:.4f}"),
+                    unsafe_allow_html=True,
+                )
+        with c3:
+            st.markdown(
+                tile("McNemar p", f"{report['mcnemar']['p_value']:.4f}"), unsafe_allow_html=True
+            )
+
+        # Both intervals, because the two metrics move in opposite directions here and showing
+        # only one would let a reader pick the flattering story.
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+        intervals = [
+            {
+                "quantity": "accuracy difference",
+                "estimate": f"{report['bootstrap']['observed_difference']:+.4f}",
+                "95% CI": f"[{report['bootstrap']['ci_low']:+.4f}, "
+                f"{report['bootstrap']['ci_high']:+.4f}]",
+                "excludes 0": "no"
+                if report["bootstrap"]["ci_low"] <= 0 <= report["bootstrap"]["ci_high"]
+                else "yes",
+            }
+        ]
+        macro = report.get("macro_f1_bootstrap")
+        if macro:
+            intervals.append(
+                {
+                    "quantity": "macro-F1 difference",
+                    "estimate": f"{macro['observed_difference']:+.4f}",
+                    "95% CI": f"[{macro['ci_low']:+.4f}, {macro['ci_high']:+.4f}]",
+                    "excludes 0": "no" if macro["ci_low"] <= 0 <= macro["ci_high"] else "yes",
+                }
+            )
+        st.dataframe(intervals, use_container_width=True, hide_index=True)
+
+        mc = report["mcnemar"]
+        st.markdown(
+            f"**The comparison rests on {mc['only_a_correct'] + mc['only_b_correct']} images.** "
+            f"{mc['both_correct']:,} both got right and {mc['both_wrong']} both got wrong; those "
+            f"carry no information about which is better. Of the rest, "
+            f"{mc['only_a_correct']} went to the baseline and {mc['only_b_correct']} to the "
+            f"challenger — close enough to a coin flip that McNemar returns "
+            f"p = {mc['p_value']:.3f}."
+        )
+
+        for note in report.get("notes", []):
+            st.caption(note)
+        st.json(report, expanded=False)
+
+
 # --------------------------------------------------------------------------- sidebar
 
 models = load_registry()
-available = [m for m in models if m["available"]]
+runnable = [m for m in models if m["available"] or m["fetchable"]]
 
 st.sidebar.title("CropGuard")
 st.sidebar.caption("38-class crop disease classifier · ONNX")
 
-choices = [API_CHOICE] + [m["id"] for m in available]
+choices = [API_CHOICE] + [m["id"] for m in runnable]
 mode = st.sidebar.radio("Mode", ["Single model", "Compare models"], horizontal=True)
 
 if mode == "Single model":
@@ -226,7 +395,10 @@ if mode == "Single model":
         )
     ]
 else:
-    default = [m["id"] for m in available[:2]] or [API_CHOICE]
+    # Prefer models already on disk, so the default selection never opens with a download.
+    # The sort is stable, so registry order decides among equals.
+    ready_first = sorted(runnable, key=lambda m: not m["available"])
+    default = [m["id"] for m in ready_first[:2]] or [API_CHOICE]
     selected = st.sidebar.multiselect(
         "Models to compare",
         choices,
@@ -242,12 +414,26 @@ if API_CHOICE in selected:
         "~50 s extra on the first request after 15 minutes idle, while the instance wakes."
     )
 
-missing = [m for m in models if not m["available"]]
-if missing:
+to_fetch = [m["name"] for m in runnable if not m["available"]]
+if to_fetch:
     st.sidebar.caption(
-        "Not on disk: " + ", ".join(m["name"] for m in missing) + ". Export or download the "
-        "ONNX file to enable it."
+        "Downloaded from the Hub on first use: "
+        + ", ".join(to_fetch)
+        + ". The first prediction with one of these pays for the download; later ones do not."
     )
+
+unavailable = [m["name"] for m in models if not (m["available"] or m["fetchable"])]
+if unavailable:
+    st.sidebar.caption(
+        "Not runnable here: " + ", ".join(unavailable) + " — no local file and not on the Hub."
+    )
+    # An escape hatch, because "wait for a cache to expire" is a terrible answer to "I just
+    # published that model and it is not showing".
+    if st.sidebar.button("Re-check the Hub", use_container_width=True):
+        hub_files.clear()
+        load_registry.clear()
+        load_comparison.clear()
+        st.rerun()
 
 st.sidebar.divider()
 
@@ -296,13 +482,19 @@ if uploaded is None:
                 if test
                 else "no full-holdout evaluation"
             )
-            state = "available" if entry["available"] else "file not present"
+            if entry["available"]:
+                state = "on disk"
+            elif entry["fetchable"]:
+                state = f"fetched from {entry['hub_repo']} on first use"
+            else:
+                state = "not runnable here"
             st.markdown(
                 f"**{entry['name']}** — {entry['role']} · {state}  \n"
                 f"{entry['architecture']}  \n"
                 f"{measured}  \n"
                 f"_{entry['note']}_"
             )
+    render_comparison_report()
     st.stop()
 
 image_bytes = uploaded.getvalue()
@@ -383,6 +575,24 @@ if mode == "Single model":
         "measures spread in this one softmax, so it cannot flag an input that is simply unlike "
         "anything in training."
     )
+
+    entry = (
+        next((m for m in models if m["role"] == "production"), None)
+        if choice == API_CHOICE
+        else next(m for m in models if m["id"] == choice)
+    )
+    if entry and entry.get("test"):
+        st.caption(
+            f"**{entry['name']}** on the 8,125-image holdout: accuracy "
+            f"{entry['test']['accuracy']:.4f}, macro-F1 **{entry['test']['macro_f1']:.4f}**. "
+            f"Read macro-F1 — the dataset is imbalanced ~36×, so accuracy is dominated by the "
+            f"largest classes. One image tells you nothing about either number."
+        )
+    elif entry:
+        st.caption(
+            f"**{entry['name']}** has no full-holdout evaluation, so no accuracy is claimed "
+            f"for it. {entry['note']}"
+        )
 
     with st.expander("All 38 class probabilities"):
         st.dataframe(
@@ -471,36 +681,39 @@ else:
         "Comparing their latencies compares two machines, not two models."
     )
 
-# ---- the A/B verdict ------------------------------------------------------------------
+    # ---- measured accuracy, next to the live guess -------------------------------------
+    #
+    # The prediction above is one image. These are the numbers that actually rank the models,
+    # and putting them side by side is the point: a visitor who watches two models agree on
+    # their leaf should not conclude anything about which is better.
+    st.divider()
+    st.markdown(
+        '<div class="cg"><div class="cg-eyebrow">Measured on the 8,125-image holdout</div></div>',
+        unsafe_allow_html=True,
+    )
 
-if COMPARISON_PATH.exists():
-    with st.expander("A/B test result (artifacts/ab_comparison.json)"):
-        with open(COMPARISON_PATH, encoding="utf-8") as f:
-            report = json.load(f)
+    rows = []
+    for choice, result, _, server_ms, _error in outcomes:
+        if choice == API_CHOICE:
+            entry = next((m for m in models if m["role"] == "production"), None)
+        else:
+            entry = next(m for m in models if m["id"] == choice)
+        test = (entry or {}).get("test")
+        rows.append(
+            {
+                "model": label_for(choice, models),
+                "test accuracy": f"{test['accuracy']:.4f}" if test else "not measured",
+                "test macro-F1": f"{test['macro_f1']:.4f}" if test else "not measured",
+                "this image": pretty(result["predicted_class"]) if result else "—",
+                "inference": f"{server_ms:.0f} ms" if result else "—",
+            }
+        )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.caption(
+        "**Macro-F1 is the number to read**, not accuracy: the dataset is imbalanced ~36×, so "
+        "accuracy is dominated by the largest classes. The INT8 build has no full-holdout "
+        "figure — it was checked against fp32 on a 3,000-image subset (9 disagreements) and "
+        "that is not the same measurement, so nothing is claimed for it here."
+    )
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown(
-                tile(
-                    "Accuracy",
-                    f"{report['accuracy_a']:.4f} → {report['accuracy_b']:.4f}",
-                ),
-                unsafe_allow_html=True,
-            )
-        with c2:
-            if report.get("macro_f1_a") is not None:
-                st.markdown(
-                    tile(
-                        "Macro-F1",
-                        f"{report['macro_f1_a']:.4f} → {report['macro_f1_b']:.4f}",
-                    ),
-                    unsafe_allow_html=True,
-                )
-        with c3:
-            st.markdown(
-                tile("McNemar p", f"{report['mcnemar']['p_value']:.4f}"), unsafe_allow_html=True
-            )
-
-        for note in report.get("notes", []):
-            st.caption(note)
-        st.json(report, expanded=False)
+render_comparison_report()

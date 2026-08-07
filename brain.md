@@ -42,8 +42,10 @@ baseline still serves traffic — but the two metrics disagreed, which is the in
 | Test accuracy | **0.9911** | 0.9908 |
 | Test macro-F1 | 0.9865 | **0.9890** |
 
-Accuracy down 0.0004, macro-F1 up 0.0025. Full treatment in §8.10, including why the per-class
-test could never have settled it and what was added to fix that.
+Accuracy down 0.0004, macro-F1 up 0.0025 — and a paired bootstrap over the 8,125 images puts
+the macro-F1 difference at **95% CI [-0.0015, +0.0067]**, which spans zero. So the challenger
+is not better on either metric, and this is a properly powered null rather than "we could not
+tell". Full treatment in §8.10.
 
 ### Live deployment
 
@@ -796,9 +798,10 @@ holdout, against the deployed ResNet50 baseline.
 | Fitted temperature | 0.591 | 0.5914 |
 
 ```
-McNemar: 49 discordant for A vs 46 for B, stat=0.0421, p=0.8374  -> not significant
-Bootstrap: diff=-0.0004, 95% CI [-0.0027, +0.0020]               -> includes 0
-VERDICT: no significant improvement demonstrated                  (exit 1)
+McNemar:            49 discordant for A vs 46 for B, p=0.8374     -> not significant
+Bootstrap accuracy: diff=-0.0004, 95% CI [-0.0027, +0.0020]       -> includes 0
+Bootstrap macro-F1: diff=+0.0025, 95% CI [-0.0015, +0.0067]       -> includes 0
+VERDICT: no significant improvement demonstrated                   (exit 1)
 ```
 
 **The gate declined and the challenger was not deployed.** That is the framework working. The
@@ -844,6 +847,30 @@ One detail with a reason: each resample averages F1 over classes **present in th
 ground truth**, not over all 38. Otherwise a resample that happened to omit a 24-image class
 would score it zero and be recorded as a failure on a class it never sampled.
 
+### And the answer it gave
+
+  `macro-F1 difference = +0.0025, 95% CI [-0.0015, +0.0067]`
+
+**The interval spans zero, so the macro-F1 gain does not survive resampling either.** The
+challenger is not better on the metric that appeared to favour it.
+
+This is the payoff for building the test rather than arguing from the point estimate. Before
+it, the position was uncomfortable: the gate said no, the metric the documentation calls
+primary said yes, and the only test addressing balance was too underpowered to arbitrate. It
+would have been easy — and wrong — to write "macro-F1 improved by 0.0025" in a résumé bullet
+and let a reader assume that meant something.
+
+The result also changes the *kind* of null this is. The per-class t-test returned "we could
+not tell", which is nearly content-free. This one is properly powered: 8,125 resampled images
+put the true macro-F1 difference somewhere between -0.0015 and +0.0067, and the interval is
+narrow enough that any effect it hides is smaller than what a retrain's random seed would move.
+"Not significant" and "not detectably different from zero, with a tight bound" are different
+claims, and only the second is worth stating.
+
+Note what it does *not* say: the point estimate is still positive, and an interval containing
+zero is not evidence of equivalence (§8.6). It says the evidence does not support promotion,
+which is exactly what a promotion gate should require.
+
 ### Why the gate was not widened to accept a macro-F1 win
 
 Because the rule was fixed before the challenger existed. Loosening it after seeing which
@@ -856,6 +883,10 @@ that so a later refactor cannot quietly soften it.
 The defensible way to act on the macro-F1 signal is to pre-register it as primary **before**
 the next challenger trains, and say so in writing. That is a decision about the next
 experiment, not a reinterpretation of this one.
+
+As it happens the gate would have declined either way — the macro-F1 interval spans zero too.
+That is a comfortable outcome and it is worth being clear that the comfort is luck: the
+principle had to hold before the number was known, or it is not a principle.
 
 ### Two smaller findings
 
@@ -949,7 +980,7 @@ The lesson generalises: "4× smaller" and "4× faster" are different claims requ
 measurements, and quantisation only delivers the second when the runtime has a kernel for the
 ops it produces.
 
-### Static quantisation — built, measured, and still not deployed
+### Static quantisation — built, measured, published, still not serving
 
 `cropguard.serving.quantize` implements the correct approach: calibrate activation ranges up
 front on real images, then emit `QLinearConv`.
@@ -977,7 +1008,13 @@ instructions.**
 This is why the benchmark above does not settle the deployment question: it was run on the
 wrong machine. Server CPUs (Xeon Cascade Lake and later, AMD Zen 4) generally *do* have
 AVX-512 VNNI, where static INT8 would likely win on both size and speed. **The measurement
-that decides is the one taken on the deployment target**, and that is not yet done.
+that decides is the one taken on the deployment target.**
+
+**That measurement is now available to take.** Both files are published to the Hub and both
+are selectable in the demo panel, so running them side by side on the Space measures exactly
+the thing the laptop could not. The API still serves fp32 — nothing is promoted on the
+strength of an argument about instruction sets — but the comparison no longer depends on
+owning the right CPU.
 
 Accuracy is unaffected: the two models disagreed on **9 of 3000** images. Note carefully what
 that does and does not establish — see §8.7.

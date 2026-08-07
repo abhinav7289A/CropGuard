@@ -4,6 +4,9 @@ Production MLOps pipeline for crop disease detection — 38-class leaf classifie
 PlantVillage, served as a CPU-only ONNX API with experiment tracking, statistical A/B testing,
 and drift monitoring. Runs entirely on free tiers.
 
+> **Live demo: https://huggingface.co/spaces/XiElonMAsk/cropguard** — pick a model, compare
+> fp32 against static INT8 side by side, toggle calibration
+>
 > **Live API: https://cropguard-api-w9ch.onrender.com** — `/health` · `/predict` · `/metrics`
 >
 > **Status: baseline trained, evaluated, calibrated and deployed.** The ConvNeXt-Tiny
@@ -349,6 +352,30 @@ Two things it does that a plain demo does not:
 If `artifacts/ab_comparison.json` is present the panel also surfaces the A/B verdict, so the
 demo reports the comparison rather than only the winner.
 
+### Deploying the panel to a Space
+
+**Live at https://huggingface.co/spaces/XiElonMAsk/cropguard.** To redeploy after a change:
+
+```bash
+export HF_TOKEN=hf_...                                   # write token
+python scripts/deploy_space.py --repo <user>/cropguard    # --dry-run to preview
+```
+
+The script uploads the app, both configs, `spaces/Dockerfile` and the torch-free
+`cropguard.serving` package — 34 KB in total. It builds as a **Docker** Space, not a Streamlit
+one: the Hub no longer accepts `streamlit` as an SDK for new Spaces, so the Dockerfile runs
+Streamlit itself on port 7860. **Weights are not uploaded.** The panel pulls them from
+[`XiElonMAsk/cropguard-models`](https://huggingface.co/XiElonMAsk/cropguard-models) on first
+use, so the demo and the API load the same artifact and a new model never has to be copied to
+two places. `spaces/README.md` becomes the Space card; its YAML front matter is what tells
+Spaces which SDK to run.
+
+Running models in-process on a Space (2 vCPU) rather than calling the Render API (0.1 vCPU) is
+roughly a hundredfold difference in latency for the same ONNX graph — which is the §11 lesson
+made clickable rather than a table in a document. Keeping both backends selectable is the point:
+the panel can show the same model at ~3.5 s and at ~50 ms, and the only thing that changed is
+how much CPU somebody allocated.
+
 ## Statistical model comparison
 
 Accuracy going up is not evidence that a model is better. `cropguard.evaluation` runs the
@@ -388,11 +415,18 @@ reading carefully before treating that as a failure:
   d = 0.200 gives power 0.225, and 0.8 would need 198 classes. No amount of extra labelling
   fixes that, because the dataset has 38 diseases and always will.
 
-The macro-F1 bootstrap (`bootstrap_macro_f1_difference`) exists to answer the question those
-two points raise — it resamples the 8,125 images and recomputes the macro statistic, so it is
-powered by the holdout rather than by the class count. It was added after the run above, so
-re-running `compare` on the same prediction files now prints a macro-F1 CI alongside the
-accuracy one.
+The macro-F1 bootstrap (`bootstrap_macro_f1_difference`) answers the question those two points
+raise: it resamples the 8,125 images and recomputes the macro statistic, so it is powered by
+the holdout rather than by the class count. Run on these same prediction files:
+
+```
+macro-F1 Bootstrap (10000 resamples): diff=+0.0025, 95% CI [-0.0015, +0.0067] -> includes 0
+```
+
+**The macro-F1 gain does not survive resampling either**, so the challenger is not better on
+the metric that appeared to favour it. That turns a "we could not tell" into a properly
+powered null: the true difference sits between -0.0015 and +0.0067, tighter than the variation
+a different random seed would produce.
 
 The gate itself stays keyed on accuracy on purpose. The rule was fixed before any challenger
 was trained, and widening it to accept a macro-F1 win *after* seeing which metric moved would
